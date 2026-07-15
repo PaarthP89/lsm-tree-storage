@@ -1,1 +1,14 @@
 # gitignore :)
+
+# runtime data directories (WAL/MANIFEST/SSTables from Open())
+/data/
+*.sst
+*.log
+
+# go build/test artifacts
+*.test
+*.out
+/bin/
+
+# OS
+.DS_Store
