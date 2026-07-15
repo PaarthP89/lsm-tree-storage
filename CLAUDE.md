@@ -228,14 +228,14 @@ useful once Target tier is done.
 
 ## 11. Status — UPDATE THIS EVERY SESSION
 
-**Current phase:** Phase 2 — In-Memory Engine (not yet started)
-**Last completed phase:** Phase 1 — Durable Log (WAL writer/reader, entry
-encode/decode, torn-tail replay, segment rotation)
+**Current phase:** Phase 3 — Persistence (not yet started)
+**Last completed phase:** Phase 2 — In-Memory Engine (skip-list memtable,
+wired to WAL, `DB.Open`/`Put`/`Delete`/`Get`/`Close`)
 
 | Phase | Status | Notes |
 |---|---|---|
 | 1 — Durable Log | Done | `wal` package: `Entry` encode/decode, `Writer.Append` (fsync before ack), `Replay` (stops clean at torn/corrupt record, no error), segment rotation via `SetMaxSegmentBytes`. All tests + `go vet` clean. |
-| 2 — In-Memory Engine | Not started | |
+| 2 — In-Memory Engine | Done | `memtable.SkipList` (probabilistic levels, p=0.25, single `sync.RWMutex`): `Put`/`Delete`/`Get` (found vs. tombstone distinguished internally), sorted `Iterator`, `SizeBytes`. Root `DB` in `db.go`: `Open` replays `wal.Replay` into a fresh memtable then opens a new segment via `wal.NextSegmentPath` (never reopens the last segment); `Put`/`Delete` append-then-mutate, never the reverse; `Get` collapses "not found" and "tombstone" to `found=false`. `cmd/lsmload` helper + `killrestart_test.go` drive a real subprocess SIGKILL mid-burst (5 iterations) and confirm recovered keys are a subset of what was sent with byte-exact values, no corruption. All tests + `go vet` + `-race` clean. |
 | 3 — Persistence | Not started | |
 | 4 — Crash-Safe Metadata | Not started | |
 | 5 — Chaos Test | Not started | |
@@ -266,7 +266,11 @@ beyond the Phase 1 brief's listed signatures, not a deviation from a
 LOCKED section — it exists to make the LOCKED crash-recovery guarantee
 (§2, "zero data loss for any acknowledged write") actually achievable by
 Phase 4, given the sequential-append-only invariant (§8) rules out
-truncate-and-resume as a fix.
+truncate-and-resume as a fix. Phase 2 added `cmd/lsmload`, a small helper
+binary (not part of any locked interface) that exists solely so
+`killrestart_test.go` can drive a real subprocess through a SIGKILL —
+per §12's preference for real `kill -9` tests over in-process
+simulation.
 
 ---
 
