@@ -1,12 +1,20 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// ErrTornSegment is returned by NewWriter when the target segment already
+// exists and ends mid-record. Appending past a torn tail would make every
+// new record unreachable, since Replay stops at a segment's first torn
+// record and never looks past it -- resume writes into a fresh segment
+// via NextSegmentPath instead.
+var ErrTornSegment = errors.New("wal: segment has a torn tail")
 
 // DefaultMaxSegmentBytes is the size threshold at which a segment is
 // rotated. Tunable via Writer.SetMaxSegmentBytes.
@@ -43,6 +51,18 @@ func NewWriter(path string) (*Writer, error) {
 
 	seq, err := parseSeq(filepath.Base(path))
 	if err != nil {
+		return nil, err
+	}
+
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		torn, err := segmentHasTornTail(path)
+		if err != nil {
+			return nil, err
+		}
+		if torn {
+			return nil, fmt.Errorf("wal: %s: %w (use NextSegmentPath to resume writes after recovery)", path, ErrTornSegment)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 

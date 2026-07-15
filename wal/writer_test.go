@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -162,12 +163,13 @@ func TestSegmentRotation(t *testing.T) {
 	}
 }
 
-// TestAppendAfterTornTailIsUnreachable documents a real footgun: if a
-// caller reopens the *last* segment after a crash (instead of using
-// NextSegmentPath) and appends past a torn tail, those new entries are
-// permanently lost on replay, along with anything else in that segment.
-// This is why NextSegmentPath exists — see its doc comment.
-func TestAppendAfterTornTailIsUnreachable(t *testing.T) {
+// TestNewWriterRejectsTornSegment proves the footgun is now closed at the
+// API level: NewWriter refuses to open a segment that ends mid-record,
+// rather than silently allowing appends past the tear that would become
+// permanently unreachable (Replay stops at a segment's first torn record
+// and never looks past it, even at later, fully-valid records in that
+// same file).
+func TestNewWriterRejectsTornSegment(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "000001.log")
 
@@ -190,10 +192,44 @@ func TestAppendAfterTornTailIsUnreachable(t *testing.T) {
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	// Wrong recovery: reopen the same (now torn) segment and keep writing.
-	w2, err := NewWriter(path)
+	_, err = NewWriter(path)
+	if !errors.Is(err, ErrTornSegment) {
+		t.Fatalf("NewWriter err = %v, want ErrTornSegment", err)
+	}
+
+	// The rejected open must not have touched the file -- the torn tail
+	// (and nothing else) is still exactly what Replay can recover.
+	got, err := Replay(dir)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d entries, want 0", len(got))
+	}
+}
+
+// TestNewWriterAllowsCleanExistingSegment confirms the check isn't
+// overzealous: reopening a segment that ends cleanly (no crash, no torn
+// tail) must still work, so a graceful restart can keep appending to an
+// existing, non-full segment.
+func TestNewWriterAllowsCleanExistingSegment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "000001.log")
+
+	w, err := NewWriter(path)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Append(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	w2, err := NewWriter(path)
+	if err != nil {
+		t.Fatalf("NewWriter on clean existing segment: %v", err)
 	}
 	if err := w2.Append(Entry{Op: OpPut, Key: []byte("b"), Value: []byte("2")}); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -206,8 +242,8 @@ func TestAppendAfterTornTailIsUnreachable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("got %d entries, want 0 (both records are unreachable behind the torn tail) -- if this now passes with len(got)==2, NextSegmentPath is no longer needed and this test/comment should be revisited", len(got))
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2", len(got))
 	}
 }
 

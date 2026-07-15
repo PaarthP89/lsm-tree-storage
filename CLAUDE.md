@@ -246,18 +246,20 @@ encode/decode, torn-tail replay, segment rotation)
 | 8c — Concurrent readers/writers | Not started (stretch) | |
 | 8d — Multi-level compaction | Not started (stretch) | |
 
-**Known deliberate gaps at current state:**
-- `wal.NewWriter` will happily reopen and append to an existing segment
-  that has a torn tail (e.g. the file `DB.Open` finds mid-recovery). Doing
-  so makes every record appended after the tear permanently unreachable —
-  `Replay` stops at a segment's first torn record and never looks past it,
-  even at later, fully-valid records in that same file. `wal.NextSegmentPath`
-  exists to avoid this (see its doc comment) and returns the correct path
-  for a fresh segment to resume writes into after a Replay. Phase 4's
-  `DB.Open`/recovery sequence MUST use `NextSegmentPath` rather than
-  reopening the last segment named in the reconstructed set. Verified this
-  failure mode and the fix both empirically (`wal` package tests
-  `TestAppendAfterTornTailIsUnreachable` / `TestNextSegmentPathAvoidsTornTailFootgun`).
+**Known deliberate gaps at current state:** none open. (Previously:
+`wal.NewWriter` silently allowed reopening a torn segment and appending
+past the tear, which made the new records permanently unreachable —
+`Replay` stops at a segment's first torn record and never looks past it.
+Closed by making `NewWriter` return `ErrTornSegment` instead of opening in
+that case, so the failure is a loud error at Open time, not silent data
+loss. `wal.NextSegmentPath` is the documented way to resume writes after
+a Replay — it always names a fresh segment. Phase 4's `DB.Open`/recovery
+sequence should still use `NextSegmentPath` rather than reopening the
+last segment named in the reconstructed set, both because that's the
+correct pattern and because reopening a *clean* last segment is still
+technically allowed by `NewWriter`. Verified via `wal` package tests
+`TestNewWriterRejectsTornSegment`, `TestNewWriterAllowsCleanExistingSegment`,
+`TestNextSegmentPathAvoidsTornTailFootgun`.)
 
 **Deviations from this spec:** none. `wal.NextSegmentPath` is an addition
 beyond the Phase 1 brief's listed signatures, not a deviation from a

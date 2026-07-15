@@ -125,6 +125,31 @@ func Replay(dir string) ([]Entry, error) {
 	return entries, nil
 }
 
+// segmentHasTornTail reports whether the segment at path ends mid-record
+// (a truncated write or a checksum mismatch), as opposed to ending
+// cleanly at a record boundary. Used by NewWriter to refuse to append
+// past a torn tail -- see ErrTornSegment.
+func segmentHasTornTail(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	for {
+		_, err := readRecord(f)
+		if err == io.EOF {
+			return false, nil
+		}
+		if err == errTorn {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+}
+
 func segmentNames(dir string) ([]string, error) {
 	des, err := os.ReadDir(dir)
 	if err != nil {
