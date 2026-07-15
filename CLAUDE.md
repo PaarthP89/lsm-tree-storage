@@ -228,15 +228,15 @@ useful once Target tier is done.
 
 ## 11. Status — UPDATE THIS EVERY SESSION
 
-**Current phase:** Phase 3 — Persistence (not yet started)
-**Last completed phase:** Phase 2 — In-Memory Engine (skip-list memtable,
-wired to WAL, `DB.Open`/`Put`/`Delete`/`Get`/`Close`)
+**Current phase:** Phase 4 — Crash-Safe Metadata (not yet started)
+**Last completed phase:** Phase 3 — Persistence (SSTable flush + unified
+read path: memtable → SSTables newest-to-oldest)
 
 | Phase | Status | Notes |
 |---|---|---|
 | 1 — Durable Log | Done | `wal` package: `Entry` encode/decode, `Writer.Append` (fsync before ack), `Replay` (stops clean at torn/corrupt record, no error), segment rotation via `SetMaxSegmentBytes`. All tests + `go vet` clean. |
 | 2 — In-Memory Engine | Done | `memtable.SkipList` (probabilistic levels, p=0.25, single `sync.RWMutex`): `Put`/`Delete`/`Get` (found vs. tombstone distinguished internally), sorted `Iterator`, `SizeBytes`. Root `DB` in `db.go`: `Open` replays `wal.Replay` into a fresh memtable then opens a new segment via `wal.NextSegmentPath` (never reopens the last segment); `Put`/`Delete` append-then-mutate, never the reverse; `Get` collapses "not found" and "tombstone" to `found=false`. `cmd/lsmload` helper + `killrestart_test.go` drive a real subprocess SIGKILL mid-burst (5 iterations) and confirm recovered keys are a subset of what was sent with byte-exact values, no corruption. All tests + `go vet` + `-race` clean. |
-| 3 — Persistence | Not started | |
+| 3 — Persistence | Done | `sstable` package: `FlushMemtable` writes a memtable's sorted entries (reusing `wal.EncodeEntry`/`wal.DecodeEntry` for the record format — see Deviations) plus a sparse index (every 64th entry) + min/max/count footer, via temp-file → fsync → atomic rename → directory fsync. `OpenSSTable` reads only the trailer+footer at open (checksummed, fails loudly on mismatch — every `Get` depends on the index being intact); `Get` binary-searches the sparse index and bounded-scans one block via `io.SectionReader`+`ReadAt` (proven non-full-file-scan in `TestSparseIndexBoundsScan`). `DB` wires size-triggered flush into `Put`/`Delete` (`SetFlushThreshold` for tests), discovers SSTables at `Open` via the naive directory scan the brief calls for, and `Get` falls through memtable → SSTables newest-first, first hit (including a tombstone hit) wins. A post-implementation soundness review (prompted by explicit request, not the brief) found and closed two real gaps beyond the brief's own checklist — see the former "Known deliberate gaps" entries folded into this row: (a) obsolete WAL segments are now deleted via `wal.RemoveSegmentsBefore` right after each flush's new segment is created, keeping restart-time replay cost and post-restart memtable size bounded by activity since the last flush rather than the database's entire history (`TestRestartMemtableSizeBoundedByActivitySinceLastFlush` pins this — it failed before the fix, reproducing a real ~23x memtable bloat on restart); (b) every atomic rename/segment-create (`sstable.FlushMemtable`, `wal.NewWriter`, `wal.Writer.rotate`) is now followed by an fsync of the containing directory, proven invoked (not just "file exists afterward") via spy-substituted `fsyncDir` vars in both packages. All tests + `go vet` + `-race` clean (42 tests total across all packages). Additionally validated with two ad hoc real-`kill -9` runs (throwaway, not committed): 8 iterations pre-fix and 12 post-fix, each forcing 1–2 flushes to complete mid-burst before the kill — zero corrupt/partial values recovered in any run, and post-fix runs confirm exactly one `.log` file survives on disk regardless of how many flushes completed. A second review pass (explicitly requested: fix everything not owned by a later phase) found and closed two more gaps: (c) `memtable.SkipList.SizeBytes()` previously counted only raw key+value bytes, letting real heap usage (each node's struct fields + its randomly-leveled forward-pointer array) run ahead of the configured flush threshold — now adds `nodeStructOverheadBytes` (`unsafe.Sizeof(node{})`) plus `lvl*pointerBytes` per *new* node (the exact chosen level, not an estimate; overwriting an existing key still charges only the value-byte delta, never re-charged struct overhead), verified by bounds in `TestSizeBytesGrowsAndTracksOverwrite`. This made `SizeBytes()` no longer reproducible from key/value content alone (per-node level is randomly drawn), which broke `TestRestartMemtableSizeBoundedByActivitySinceLastFlush`'s exact-byte-equality assertion — fixed by switching that test to compare live entry *count* (deterministic) instead of byte size. (d) A flush interrupted mid-write (real crash before `FlushMemtable`'s atomic rename) left a permanent orphaned `*.sst.tmp` file that nothing ever cleaned up — harmless (ignored by SSTable discovery, never read) but an unbounded disk leak given enough crashes over a long-running database's life. Closed by `removeOrphanedFlushTmpFiles`, called once at the top of `Open` before SSTable discovery; safe because a flush's rename is the sole moment it becomes durable/visible; scoped precisely (`TestOpenLeavesUnrelatedFilesAlone`) to `*.sst.tmp` so it can't delete anything else. A third finding — `DB` has no synchronization and is unsafe for concurrent `Put`/`Get`/`Delete` from multiple goroutines — was deliberately **not** fixed: full concurrent-reader/writer support is explicitly stretch phase 8c's job (§9/§10), and a rushed coarse lock now could conflict with whatever design 8c actually needs (lock-free reads during a flush swap, etc.); noted here rather than silently dropped. |
 | 4 — Crash-Safe Metadata | Not started | |
 | 5 — Chaos Test | Not started | |
 | 6 — Compaction | Not started | |
@@ -246,7 +246,65 @@ wired to WAL, `DB.Open`/`Put`/`Delete`/`Get`/`Close`)
 | 8c — Concurrent readers/writers | Not started (stretch) | |
 | 8d — Multi-level compaction | Not started (stretch) | |
 
-**Known deliberate gaps at current state:** none open. (Previously:
+**Known deliberate gaps at current state:**
+
+- **`DB` is not safe for concurrent use.** `maybeFlush` reassigns
+  `db.mem`, `db.sstables`, and `db.w` with no synchronization; calling
+  `Put`/`Get`/`Delete` from multiple goroutines concurrently is a data
+  race. Found during Phase 3's soundness review and deliberately left
+  open rather than patched with a coarse lock — concurrent
+  readers/writers is explicitly stretch phase 8c's own job (§9/§10), and
+  a hasty mutex now could conflict with whatever design 8c actually
+  needs (e.g. lock-free reads across a flush's memtable/SSTable-list
+  swap). Whoever picks up 8c should design this properly rather than
+  build on a shim.
+
+(Previously, both found and closed within Phase 3's own session, not
+deferred to a later phase:
+
+`wal` segments were never deleted after a flush, and `wal.Replay` always
+read every segment from the start of the database's history. This never
+caused a read-correctness bug (replaying every WAL entry in order into a
+fresh memtable always reconstructs each key's true latest value, however
+redundant), but it defeated the *point* of flushing across a restart —
+confirmed empirically before the fix: a run that flushed 14 SSTables and
+left ~2.6KB live in the memtable came back from `Open` with ~60KB back in
+memtable. Initially this was going to be deferred to Phase 4 on the
+assumption that "which WAL segments are obsolete" needed the same durable
+MANIFEST-style bookkeeping Phase 4 exists to build for the SSTable set —
+but that assumption was wrong: `DB` always starts a brand-new WAL segment
+at the exact moment of every flush, so every segment older than the one
+just created is provably, unconditionally superseded by the SSTable that
+flush just wrote — no MANIFEST needed to know that, the file's absence on
+disk after deletion *is* the record. Closed by `wal.RemoveSegmentsBefore`,
+called from `DB.maybeFlush` strictly after the new SSTable's rename (and
+its own directory fsync, see below) are durable, so a crash before cleanup
+just defers it to a later flush rather than losing data. Verified by
+`TestRestartMemtableSizeBoundedByActivitySinceLastFlush` (fails without
+the fix, reproducing the ~23x bloat) and by two independent throwaway
+real-`kill -9` batches (8 runs before the fix, 12 after) showing zero
+corruption in either case and exactly one surviving `.log` file per run
+post-fix regardless of flush count.
+
+Separately, SSTable flush's atomic rename (and `wal.NewWriter`/
+`Writer.rotate`'s segment creation, which had the identical gap already)
+were not followed by an `fsync` of the containing directory — on some
+filesystems a crash between a successful `rename(2)`/`create` and the
+directory entry itself being durably persisted can make that change not
+survive the crash, which is a real gap under §2's durability guarantee.
+This was riskier to leave once the WAL-retention gap above closed (that
+gap had been incidentally providing a safety net: even a "lost" flush
+rename was recoverable from the WAL, as long as the WAL was never
+deleted), so both gaps were fixed together rather than landed
+independently. Closed by an `fsyncDir` var in each of `wal` and `sstable`
+(a package-level function var specifically so tests could substitute a
+spy and prove the fsync call actually happens, not just that the
+end-state file listing looks right) called after every rename/create
+that lands a file at its permanent path. Verified by
+`TestNewWriterFsyncsDirOnFreshSegment`, `TestNewWriterDoesNotFsyncDirOnCleanReopen`,
+`TestRotateFsyncsDir`, and `sstable`'s `TestFlushFsyncsDir`.)
+
+(Previously:
 `wal.NewWriter` silently allowed reopening a torn segment and appending
 past the tear, which made the new records permanently unreachable —
 `Replay` stops at a segment's first torn record and never looks past it.
@@ -270,7 +328,29 @@ truncate-and-resume as a fix. Phase 2 added `cmd/lsmload`, a small helper
 binary (not part of any locked interface) that exists solely so
 `killrestart_test.go` can drive a real subprocess through a SIGKILL —
 per §12's preference for real `kill -9` tests over in-process
-simulation.
+simulation. Phase 3 exported `wal.EncodeEntry`/`wal.DecodeEntry` (renamed
+from the previously unexported `encode`/`readRecord`; the unexported
+`errTorn` became exported `ErrCorrupt`) purely so `sstable` could call
+the exact same record encoder/decoder rather than reimplementing the
+wire format a second time — the wire format itself (§5) is unchanged,
+this is an implementation-sharing change, not a format change. `sstable`
+treats a `DecodeEntry` failure as a hard error (not §5's "stop, no
+error" replay rule): that rule exists because a torn tail is *expected*
+at the crash-time WAL segment, but an SSTable is only ever made visible
+by an atomic rename after being fully written and fsynced, so mid-file
+corruption there can only mean real bit rot, which should fail loudly.
+Phase 3 also exported `wal.SegmentNames`/`wal.ParseSegmentSeq` (renamed
+from unexported `segmentNames`/`parseSeq`, no behavior change) and added
+`wal.RemoveSegmentsBefore`, all so `db.go` could delete obsolete WAL
+segments after a flush using the same tested filename-parsing logic
+`NewWriter`/`NextSegmentPath` already relied on, rather than a second,
+divergence-prone copy of the "NNNNNN.log" convention living in package
+`lsm`. `wal.NewWriter` and `wal.Writer.rotate` now fsync their segment's
+containing directory after creating a fresh segment file (not on a clean
+reopen of an existing one); `sstable.FlushMemtable` does the same after
+its atomic rename. None of this changes any wire format or LOCKED
+decision — it strengthens §2's existing durability guarantee for file
+creation/rename, which the original implementation hadn't fully covered.
 
 ---
 

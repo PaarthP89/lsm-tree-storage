@@ -4,11 +4,33 @@ import (
 	"bytes"
 	"math/rand"
 	"sync"
+	"unsafe"
 )
 
 const (
 	maxLevel = 32
 	p        = 0.25
+)
+
+// pointerBytes is the size of one *node -- what a single entry in a
+// node's forward slice costs. nodeStructOverheadBytes is the fixed cost
+// of a node's own struct layout: the key and value slice headers, the
+// tombstone bool (padded), and the forward slice's own three-word header
+// -- everything except the forward slice's backing array, whose size
+// depends on the node's randomly chosen level. That part is added
+// separately, per node, using the exact level insert() already computed
+// (not an average), since it's known at insert time.
+//
+// SizeBytes exists so DB can decide when a memtable has grown large
+// enough to flush (CLAUDE.md §7); counting only raw key+value bytes
+// would let actual heap usage run well ahead of the configured
+// threshold, since every node also costs slice/pointer bookkeeping on
+// top of the user's data. This is a much closer approximation of real
+// heap usage than raw bytes alone, not an exact accounting -- it doesn't
+// model the Go allocator's size-class rounding or GC bookkeeping.
+const (
+	pointerBytes            = int(unsafe.Sizeof((*node)(nil)))
+	nodeStructOverheadBytes = int(unsafe.Sizeof(node{}))
 )
 
 // Iterator walks a Memtable's entries in ascending key order. Call Next
@@ -120,7 +142,10 @@ func (s *SkipList) insert(key, value []byte, tombstone bool) {
 		n.forward[i] = update[i].forward[i]
 		update[i].forward[i] = n
 	}
-	s.sizeBytes += len(key) + len(value)
+	// nodeStructOverheadBytes + lvl*pointerBytes is charged once, here,
+	// for the new node itself -- the early-return branch above updates
+	// an *existing* node in place and must not re-charge it.
+	s.sizeBytes += len(key) + len(value) + nodeStructOverheadBytes + lvl*pointerBytes
 }
 
 func (s *SkipList) Get(key []byte) (value []byte, found bool, tombstone bool) {

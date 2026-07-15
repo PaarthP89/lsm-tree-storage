@@ -10,9 +10,13 @@ import (
 	"sort"
 )
 
-// errTorn signals a truncated or corrupt record. It never escapes this
-// package: it means "stop replay here", not "replay failed".
-var errTorn = errors.New("wal: torn record")
+// ErrCorrupt signals a truncated or corrupt record: a short read partway
+// through a record, or a checksum mismatch. Callers decide what it means
+// in context -- wal.Replay treats it as "stop replay here, don't error"
+// (a torn tail is expected at the crash-time segment), while a reader
+// finding it in a file that was only ever written whole via atomic
+// rename (e.g. an SSTable) should treat it as real corruption.
+var ErrCorrupt = errors.New("wal: corrupt or truncated record")
 
 // maxFieldLen bounds key_len/value_len before they're used to size an
 // allocation. Without this, a single bit-flip in a length field (exactly
@@ -21,48 +25,52 @@ var errTorn = errors.New("wal: torn record")
 // 4GB and attempt that allocation before the record is known to be bad.
 const maxFieldLen = 64 << 20 // 64 MiB
 
-// readRecord reads one record from r. It returns io.EOF only when r is
-// exhausted exactly at a record boundary (a clean end of segment). Any
-// other short read, or a checksum mismatch, is reported as errTorn.
-func readRecord(r io.Reader) (Entry, error) {
+// DecodeEntry reads one record from r. It returns io.EOF only when r is
+// exhausted exactly at a record boundary (a clean end of segment/file).
+// Any other short read, or a checksum mismatch, is reported as
+// ErrCorrupt.
+//
+// Exported so other packages that reuse this exact wire format (sstable's
+// data section) decode records identically rather than reimplementing it.
+func DecodeEntry(r io.Reader) (Entry, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		if err == io.EOF {
 			return Entry{}, io.EOF
 		}
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 	wantChecksum := binary.BigEndian.Uint32(hdr[:])
 
 	var opBuf [1]byte
 	if _, err := io.ReadFull(r, opBuf[:]); err != nil {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 
 	var keyLenBuf [4]byte
 	if _, err := io.ReadFull(r, keyLenBuf[:]); err != nil {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 	keyLen := binary.BigEndian.Uint32(keyLenBuf[:])
 	if keyLen > maxFieldLen {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(r, key); err != nil {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 
 	var valLenBuf [4]byte
 	if _, err := io.ReadFull(r, valLenBuf[:]); err != nil {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 	valLen := binary.BigEndian.Uint32(valLenBuf[:])
 	if valLen > maxFieldLen {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 	value := make([]byte, valLen)
 	if _, err := io.ReadFull(r, value); err != nil {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 
 	body := make([]byte, 0, 1+4+len(key)+4+len(value))
@@ -73,7 +81,7 @@ func readRecord(r io.Reader) (Entry, error) {
 	body = append(body, value...)
 
 	if crc32.ChecksumIEEE(body) != wantChecksum {
-		return Entry{}, errTorn
+		return Entry{}, ErrCorrupt
 	}
 
 	return Entry{Op: OpType(opBuf[0]), Key: key, Value: value}, nil
@@ -93,7 +101,7 @@ func readRecord(r io.Reader) (Entry, error) {
 // independent and may be fully valid, so replay must not abort the whole
 // scan just because an earlier segment ended torn.
 func Replay(dir string) ([]Entry, error) {
-	names, err := segmentNames(dir)
+	names, err := SegmentNames(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -109,8 +117,8 @@ func Replay(dir string) ([]Entry, error) {
 		}
 
 		for {
-			e, err := readRecord(f)
-			if err == io.EOF || err == errTorn {
+			e, err := DecodeEntry(f)
+			if err == io.EOF || err == ErrCorrupt {
 				break
 			}
 			if err != nil {
@@ -137,11 +145,11 @@ func segmentHasTornTail(path string) (bool, error) {
 	defer f.Close()
 
 	for {
-		_, err := readRecord(f)
+		_, err := DecodeEntry(f)
 		if err == io.EOF {
 			return false, nil
 		}
-		if err == errTorn {
+		if err == ErrCorrupt {
 			return true, nil
 		}
 		if err != nil {
@@ -150,7 +158,9 @@ func segmentHasTornTail(path string) (bool, error) {
 	}
 }
 
-func segmentNames(dir string) ([]string, error) {
+// SegmentNames returns the "NNNNNN.log" basenames present in dir, sorted
+// (fixed-width names make lexical order equal numeric order).
+func SegmentNames(dir string) ([]string, error) {
 	des, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err

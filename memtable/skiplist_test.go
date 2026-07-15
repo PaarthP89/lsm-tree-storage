@@ -150,6 +150,13 @@ func TestIteratorReflectsTombstones(t *testing.T) {
 	}
 }
 
+// TestSizeBytesGrowsAndTracksOverwrite confirms SizeBytes accounts for a
+// new node's real memory cost (raw key+value bytes *plus* the node's own
+// struct and pointer overhead -- not just the user's data, which would
+// let actual heap usage run ahead of a caller's flush threshold), and
+// that overwriting an existing key changes only the value-byte delta,
+// never re-charging the per-node overhead a second time (no new node is
+// created on that path).
 func TestSizeBytesGrowsAndTracksOverwrite(t *testing.T) {
 	s := New()
 	if s.SizeBytes() != 0 {
@@ -158,14 +165,26 @@ func TestSizeBytesGrowsAndTracksOverwrite(t *testing.T) {
 
 	s.Put([]byte("a"), []byte("1"))
 	afterFirst := s.SizeBytes()
-	if afterFirst != len("a")+len("1") {
-		t.Fatalf("SizeBytes() = %d, want %d", afterFirst, len("a")+len("1"))
+	rawFirst := len("a") + len("1")
+	if afterFirst <= rawFirst {
+		t.Fatalf("SizeBytes() = %d, want > %d (raw key+value bytes) -- a new node must also count its own struct/pointer overhead", afterFirst, rawFirst)
+	}
+	// lvl is always in [1, maxLevel], so the added overhead is bounded
+	// even though the exact level chosen for this node is random.
+	minOverhead := nodeStructOverheadBytes + 1*pointerBytes
+	maxOverhead := nodeStructOverheadBytes + maxLevel*pointerBytes
+	if want := rawFirst + minOverhead; afterFirst < want {
+		t.Fatalf("SizeBytes() = %d, want >= %d (raw bytes + minimum possible node overhead)", afterFirst, want)
+	}
+	if want := rawFirst + maxOverhead; afterFirst > want {
+		t.Fatalf("SizeBytes() = %d, want <= %d (raw bytes + maximum possible node overhead)", afterFirst, want)
 	}
 
 	s.Put([]byte("a"), []byte("longer-value"))
 	afterOverwrite := s.SizeBytes()
-	if afterOverwrite != len("a")+len("longer-value") {
-		t.Fatalf("SizeBytes() after overwrite = %d, want %d", afterOverwrite, len("a")+len("longer-value"))
+	wantDelta := len("longer-value") - len("1")
+	if got := afterOverwrite - afterFirst; got != wantDelta {
+		t.Fatalf("SizeBytes() delta after overwrite = %d, want %d -- overwriting an existing key must not re-charge per-node struct overhead", got, wantDelta)
 	}
 }
 

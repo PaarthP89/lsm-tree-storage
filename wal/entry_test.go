@@ -18,10 +18,10 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	}
 
 	for _, want := range cases {
-		buf := encode(want)
-		got, err := readRecord(bytes.NewReader(buf))
+		buf := EncodeEntry(want)
+		got, err := DecodeEntry(bytes.NewReader(buf))
 		if err != nil {
-			t.Fatalf("readRecord(%+v): %v", want, err)
+			t.Fatalf("DecodeEntry(%+v): %v", want, err)
 		}
 		if got.Op != want.Op {
 			t.Errorf("Op = %v, want %v", got.Op, want.Op)
@@ -36,19 +36,19 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 }
 
 func TestReadRecordCleanEOF(t *testing.T) {
-	_, err := readRecord(bytes.NewReader(nil))
+	_, err := DecodeEntry(bytes.NewReader(nil))
 	if err != io.EOF {
 		t.Fatalf("err = %v, want io.EOF", err)
 	}
 }
 
 func TestReadRecordCorruptChecksum(t *testing.T) {
-	buf := encode(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")})
+	buf := EncodeEntry(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")})
 	buf[0] ^= 0xFF // flip a bit in the checksum field
 
-	_, err := readRecord(bytes.NewReader(buf))
-	if err != errTorn {
-		t.Fatalf("err = %v, want errTorn", err)
+	_, err := DecodeEntry(bytes.NewReader(buf))
+	if err != ErrCorrupt {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
 	}
 }
 
@@ -58,19 +58,19 @@ func TestReadRecordCorruptLengthFieldRejectedFast(t *testing.T) {
 	buf := make([]byte, 4+1+4)
 	binary.BigEndian.PutUint32(buf[5:9], 0xFFFFFFF0)
 
-	_, err := readRecord(bytes.NewReader(buf))
-	if err != errTorn {
-		t.Fatalf("err = %v, want errTorn", err)
+	_, err := DecodeEntry(bytes.NewReader(buf))
+	if err != ErrCorrupt {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
 	}
 }
 
 func TestReadRecordTruncated(t *testing.T) {
-	buf := encode(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")})
+	buf := EncodeEntry(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")})
 
 	for cut := 1; cut < len(buf); cut++ {
-		_, err := readRecord(bytes.NewReader(buf[:cut]))
-		if err != errTorn {
-			t.Fatalf("cut=%d: err = %v, want errTorn", cut, err)
+		_, err := DecodeEntry(bytes.NewReader(buf[:cut]))
+		if err != ErrCorrupt {
+			t.Fatalf("cut=%d: err = %v, want ErrCorrupt", cut, err)
 		}
 	}
 }

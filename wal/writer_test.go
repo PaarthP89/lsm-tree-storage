@@ -141,9 +141,9 @@ func TestSegmentRotation(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	segments, err := segmentNames(dir)
+	segments, err := SegmentNames(dir)
 	if err != nil {
-		t.Fatalf("segmentNames: %v", err)
+		t.Fatalf("SegmentNames: %v", err)
 	}
 	if len(segments) < 2 {
 		t.Fatalf("got %d segments, want >= 2 (rotation didn't happen)", len(segments))
@@ -348,5 +348,152 @@ func TestReplayMissingDir(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("got %d entries, want 0", len(got))
+	}
+}
+
+// spyFsyncDir substitutes the package-level fsyncDir var so tests can
+// prove it was actually invoked, rather than just checking that the
+// directory listing looks right afterward (which would hold true even
+// without the fsync -- the point of fsyncDir is durability across a
+// crash, which a passing functional test alone can't distinguish from
+// "happened to also work without it").
+func spyFsyncDir(t *testing.T) (calls *[]string) {
+	t.Helper()
+	orig := fsyncDir
+	var got []string
+	fsyncDir = func(dir string) error {
+		got = append(got, dir)
+		return orig(dir)
+	}
+	t.Cleanup(func() { fsyncDir = orig })
+	return &got
+}
+
+func TestNewWriterFsyncsDirOnFreshSegment(t *testing.T) {
+	dir := t.TempDir()
+	calls := spyFsyncDir(t)
+
+	w, err := NewWriter(filepath.Join(dir, "000001.log"))
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	if len(*calls) != 1 || (*calls)[0] != dir {
+		t.Fatalf("fsyncDir calls = %v, want exactly one call with dir %q -- a freshly created segment's directory entry must be fsynced", *calls, dir)
+	}
+}
+
+func TestNewWriterDoesNotFsyncDirOnCleanReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "000001.log")
+
+	w, err := NewWriter(path)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Append(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	calls := spyFsyncDir(t)
+	w2, err := NewWriter(path)
+	if err != nil {
+		t.Fatalf("NewWriter (reopen): %v", err)
+	}
+	defer w2.Close()
+
+	if len(*calls) != 0 {
+		t.Fatalf("fsyncDir calls = %v, want none -- reopening an existing segment creates no new directory entry", *calls)
+	}
+}
+
+func TestRotateFsyncsDir(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(filepath.Join(dir, "000001.log"))
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	w.SetMaxSegmentBytes(1) // force rotation on the very next Append
+	defer w.Close()
+
+	calls := spyFsyncDir(t)
+	if err := w.Append(Entry{Op: OpPut, Key: []byte("a"), Value: []byte("1")}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if len(*calls) != 1 || (*calls)[0] != dir {
+		t.Fatalf("fsyncDir calls = %v, want exactly one call with dir %q -- rotation always names a brand-new segment", *calls, dir)
+	}
+}
+
+func TestRemoveSegmentsBeforeDeletesOnlyOlderSegments(t *testing.T) {
+	dir := t.TempDir()
+	for seq := 1; seq <= 4; seq++ {
+		w, err := NewWriter(filepath.Join(dir, segmentName(seq)))
+		if err != nil {
+			t.Fatalf("NewWriter(%d): %v", seq, err)
+		}
+		if err := w.Append(Entry{Op: OpPut, Key: []byte{byte(seq)}, Value: []byte("v")}); err != nil {
+			t.Fatalf("Append(%d): %v", seq, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close(%d): %v", seq, err)
+		}
+	}
+
+	if err := RemoveSegmentsBefore(dir, 3); err != nil {
+		t.Fatalf("RemoveSegmentsBefore: %v", err)
+	}
+
+	names, err := SegmentNames(dir)
+	if err != nil {
+		t.Fatalf("SegmentNames: %v", err)
+	}
+	want := []string{"000003.log", "000004.log"}
+	if len(names) != len(want) {
+		t.Fatalf("SegmentNames = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("SegmentNames = %v, want %v", names, want)
+		}
+	}
+}
+
+func TestRemoveSegmentsBeforeFsyncsDirOnlyWhenSomethingRemoved(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(filepath.Join(dir, "000001.log"))
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	calls := spyFsyncDir(t)
+
+	// Nothing has a seq < 1, so nothing should be removed or fsynced.
+	if err := RemoveSegmentsBefore(dir, 1); err != nil {
+		t.Fatalf("RemoveSegmentsBefore (no-op): %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("fsyncDir calls = %v, want none when nothing was removed", *calls)
+	}
+
+	if err := RemoveSegmentsBefore(dir, 2); err != nil {
+		t.Fatalf("RemoveSegmentsBefore: %v", err)
+	}
+	if len(*calls) != 1 || (*calls)[0] != dir {
+		t.Fatalf("fsyncDir calls = %v, want exactly one call with dir %q after an actual deletion", *calls, dir)
+	}
+}
+
+func TestRemoveSegmentsBeforeMissingDir(t *testing.T) {
+	if err := RemoveSegmentsBefore(filepath.Join(t.TempDir(), "does-not-exist"), 5); err != nil {
+		t.Fatalf("RemoveSegmentsBefore: %v", err)
 	}
 }

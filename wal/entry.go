@@ -18,10 +18,13 @@ type Entry struct {
 	Value []byte // nil/empty for OpDelete
 }
 
-// encode serializes e as:
+// EncodeEntry serializes e as:
 // [checksum: 4B CRC32][op_type: 1B][key_len: 4B][key][value_len: 4B][value]
 // The checksum covers everything after the checksum field itself.
-func encode(e Entry) []byte {
+//
+// Exported so other packages that reuse this exact wire format (sstable's
+// data section) encode records identically rather than reimplementing it.
+func EncodeEntry(e Entry) []byte {
 	body := make([]byte, 1+4+len(e.Key)+4+len(e.Value))
 	body[0] = byte(e.Op)
 	binary.BigEndian.PutUint32(body[1:5], uint32(len(e.Key)))
