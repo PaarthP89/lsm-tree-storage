@@ -228,13 +228,13 @@ useful once Target tier is done.
 
 ## 11. Status — UPDATE THIS EVERY SESSION
 
-**Current phase:** Phase 1 — Durable Log (not yet started)
-**Last completed phase:** Phase 0 — project infrastructure (go.mod, package
-skeletons for wal/memtable/sstable/manifest, Makefile, .gitignore)
+**Current phase:** Phase 2 — In-Memory Engine (not yet started)
+**Last completed phase:** Phase 1 — Durable Log (WAL writer/reader, entry
+encode/decode, torn-tail replay, segment rotation)
 
 | Phase | Status | Notes |
 |---|---|---|
-| 1 — Durable Log | Not started | |
+| 1 — Durable Log | Done | `wal` package: `Entry` encode/decode, `Writer.Append` (fsync before ack), `Replay` (stops clean at torn/corrupt record, no error), segment rotation via `SetMaxSegmentBytes`. All tests + `go vet` clean. |
 | 2 — In-Memory Engine | Not started | |
 | 3 — Persistence | Not started | |
 | 4 — Crash-Safe Metadata | Not started | |
@@ -246,15 +246,25 @@ skeletons for wal/memtable/sstable/manifest, Makefile, .gitignore)
 | 8c — Concurrent readers/writers | Not started (stretch) | |
 | 8d — Multi-level compaction | Not started (stretch) | |
 
-**Known deliberate gaps at current state:** none yet — update this as
-phases land. (Example of what belongs here once work starts: "Phase 3
-discovers SSTables via a naive directory scan; this is a known gap closed
-in Phase 4, not a bug.")
+**Known deliberate gaps at current state:**
+- `wal.NewWriter` will happily reopen and append to an existing segment
+  that has a torn tail (e.g. the file `DB.Open` finds mid-recovery). Doing
+  so makes every record appended after the tear permanently unreachable —
+  `Replay` stops at a segment's first torn record and never looks past it,
+  even at later, fully-valid records in that same file. `wal.NextSegmentPath`
+  exists to avoid this (see its doc comment) and returns the correct path
+  for a fresh segment to resume writes into after a Replay. Phase 4's
+  `DB.Open`/recovery sequence MUST use `NextSegmentPath` rather than
+  reopening the last segment named in the reconstructed set. Verified this
+  failure mode and the fix both empirically (`wal` package tests
+  `TestAppendAfterTornTailIsUnreachable` / `TestNextSegmentPathAvoidsTornTailFootgun`).
 
-**Deviations from this spec:** none yet. If a future session needs to
-deviate from a LOCKED section above, record it here with the reason, and
-update the relevant LOCKED section rather than leaving the doc
-inconsistent with the code.
+**Deviations from this spec:** none. `wal.NextSegmentPath` is an addition
+beyond the Phase 1 brief's listed signatures, not a deviation from a
+LOCKED section — it exists to make the LOCKED crash-recovery guarantee
+(§2, "zero data loss for any acknowledged write") actually achievable by
+Phase 4, given the sequential-append-only invariant (§8) rules out
+truncate-and-resume as a fix.
 
 ---
 
