@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/paarthsiphone/lsm-tree-storage/manifest"
 	"github.com/paarthsiphone/lsm-tree-storage/memtable"
 	"github.com/paarthsiphone/lsm-tree-storage/sstable"
 	"github.com/paarthsiphone/lsm-tree-storage/wal"
@@ -26,9 +27,10 @@ const (
 
 // DB is the embedded engine's public API.
 type DB struct {
-	dir string
-	w   *wal.Writer
-	mem *memtable.SkipList
+	dir          string
+	w            *wal.Writer
+	mem          *memtable.SkipList
+	manifestPath string
 
 	// sstables holds every discovered/flushed SSTable, newest first.
 	// This ordering is what makes the newest-wins read path correct:
@@ -39,14 +41,48 @@ type DB struct {
 	flushThreshold int
 }
 
-// Open replays dir's WAL into a fresh memtable, discovers any existing
-// SSTables, and opens a new WAL segment for continued appends. Recovery
+// Open reconstructs a DB's exact pre-crash state via the fixed recovery
+// sequence CURRENT -> MANIFEST -> SSTable set -> WAL -> memtable (§7):
+// the MANIFEST-reconstructed SSTable set must be settled before WAL
+// replay, since WAL replay rebuilds the memtable *on top of* that
+// already-settled set. Concretely: read CURRENT to find the active
+// MANIFEST, replay it to get the authoritative live SSTable filenames,
+// open exactly those files (any ".sst" on disk not in that set is
+// ignored -- orphaned, not deleted), then replay the WAL into a fresh
+// memtable and open a new WAL segment for continued appends. Recovery
 // always resumes on a brand-new WAL segment (via wal.NextSegmentPath)
 // rather than reopening the last one, since the last segment may end
 // with a torn record from an in-progress write at crash time.
 func Open(dir string) (*DB, error) {
 	walDir := filepath.Join(dir, walSubdir)
 	sstDir := filepath.Join(dir, sstableSubdir)
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(sstDir, 0o755); err != nil {
+		return nil, err
+	}
+
+	manifestName, err := ensureManifest(dir)
+	if err != nil {
+		return nil, err
+	}
+	manifestPath := filepath.Join(dir, manifestName)
+
+	edits, err := manifest.ReplayManifest(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	liveSSTables := manifest.ReconstructSSTableSet(edits)
+
+	if err := removeOrphanedFlushTmpFiles(sstDir); err != nil {
+		return nil, err
+	}
+	sstables, nextSeq, err := openSSTables(sstDir, liveSSTables)
+	if err != nil {
+		return nil, err
+	}
 
 	entries, err := wal.Replay(walDir)
 	if err != nil {
@@ -65,17 +101,6 @@ func Open(dir string) (*DB, error) {
 		}
 	}
 
-	if err := os.MkdirAll(sstDir, 0o755); err != nil {
-		return nil, err
-	}
-	if err := removeOrphanedFlushTmpFiles(sstDir); err != nil {
-		return nil, err
-	}
-	sstables, nextSeq, err := openSSTables(sstDir)
-	if err != nil {
-		return nil, err
-	}
-
 	path, err := wal.NextSegmentPath(walDir)
 	if err != nil {
 		return nil, err
@@ -89,10 +114,34 @@ func Open(dir string) (*DB, error) {
 		dir:            dir,
 		w:              w,
 		mem:            mem,
+		manifestPath:   manifestPath,
 		sstables:       sstables,
 		nextSeq:        nextSeq,
 		flushThreshold: defaultFlushThreshold,
 	}, nil
+}
+
+// ensureManifest returns the active MANIFEST's filename, per CURRENT.
+// A fresh database (no CURRENT file yet) durably creates one pointing at
+// manifest.InitialFileName -- the MANIFEST file itself doesn't need to
+// exist as an empty file up front, since manifest.AppendEdit creates it
+// on the first flush, and manifest.ReplayManifest treats a missing file
+// as "zero edits", which is exactly correct for a database that hasn't
+// flushed anything yet.
+func ensureManifest(dir string) (string, error) {
+	name, err := manifest.ReadCurrent(dir)
+	if err == nil {
+		return name, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	name = manifest.InitialFileName
+	if err := manifest.WriteCurrent(dir, name); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // removeOrphanedFlushTmpFiles deletes any "*.sst.tmp" file left behind by
@@ -129,47 +178,57 @@ func removeOrphanedFlushTmpFiles(dir string) error {
 	return nil
 }
 
-// openSSTables performs a naive directory scan of dir for "NNNNNN.sst"
-// files, opens each one (reading only its footer/index, never its data
-// section), and returns them ordered newest-first by sequence number,
-// plus the next sequence number to use for a future flush.
+// openSSTables opens exactly the SSTable files named in live (the
+// MANIFEST-reconstructed authoritative set -- see manifest.
+// ReconstructSSTableSet), reading only each file's footer/index, never
+// its data section, and returns them ordered newest-first by sequence
+// number.
 //
-// This is a deliberate, temporary discovery mechanism, per the Phase 3
-// brief: it can't distinguish a legitimate SSTable from one orphaned by
-// a half-finished future compaction, because there's no durable record
-// yet of "which files are actually part of the database" -- that's
-// Phase 4's MANIFEST.
-func openSSTables(dir string) (tables []*sstable.SSTable, nextSeq int, err error) {
+// It's deliberate that this opens live's names directly rather than
+// intersecting them with a directory scan: the MANIFEST is authoritative
+// (§7), so a name it lists as live but that's actually missing from disk
+// is real corruption -- silently opening fewer tables than the MANIFEST
+// promises would be the same class of bug sstable.OpenSSTable's footer
+// checksum and wal's non-torn-tail corruption both refuse to allow
+// elsewhere in this codebase (fail loudly, don't silently drop data).
+//
+// nextSeq, by contrast, is derived from every ".sst" file actually
+// present in dir, not just the live set: a file orphaned by a crash
+// between an SSTable's atomic rename and its MANIFEST append (see
+// maybeFlush) is correctly left unopened, but its sequence number must
+// still not be reused, or a future flush's atomic rename would silently
+// overwrite it.
+func openSSTables(dir string, live []string) (tables []*sstable.SSTable, nextSeq int, err error) {
 	des, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	var names []string
+	maxSeq := 0
 	for _, de := range des {
 		if de.IsDir() {
 			continue
 		}
-		if filepath.Ext(de.Name()) == ".sst" {
-			names = append(names, de.Name())
+		if filepath.Ext(de.Name()) != ".sst" {
+			continue
 		}
-	}
-	sort.Strings(names) // "NNNNNN.sst" is fixed-width, so lexical order == numeric order
-
-	tables = make([]*sstable.SSTable, 0, len(names))
-	maxSeq := 0
-	for _, name := range names {
-		seq, err := parseSSTableSeq(name)
+		seq, err := parseSSTableSeq(de.Name())
 		if err != nil {
 			return nil, 0, err
 		}
 		if seq > maxSeq {
 			maxSeq = seq
 		}
+	}
 
+	names := append([]string(nil), live...)
+	sort.Strings(names) // "NNNNNN.sst" is fixed-width, so lexical order == numeric order; also defends against relying on manifest.ReconstructSSTableSet's own ordering guarantee
+
+	tables = make([]*sstable.SSTable, 0, len(names))
+	for _, name := range names {
 		st, err := sstable.OpenSSTable(filepath.Join(dir, name))
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("lsm: MANIFEST lists %s as a live SSTable but it failed to open: %w", name, err)
 		}
 		tables = append(tables, st)
 	}
@@ -225,10 +284,8 @@ func (db *DB) Delete(key []byte) error {
 
 // maybeFlush flushes the current memtable to a new SSTable if it has
 // grown past the flush threshold. On success, it swaps in a fresh empty
-// memtable and starts a new WAL segment; the old WAL segment is left on
-// disk (its data is now durable in the SSTable, but Phase 3 doesn't
-// clean up old segments yet -- that's a deferred, non-correctness-
-// affecting cleanup per the brief).
+// memtable, starts a new WAL segment, and deletes WAL segments now
+// superseded by the flush.
 func (db *DB) maybeFlush() error {
 	if db.mem.SizeBytes() < db.flushThreshold {
 		return nil
@@ -237,6 +294,22 @@ func (db *DB) maybeFlush() error {
 	seq := db.nextSeq
 	path := sstablePath(db.dir, seq)
 	if _, err := sstable.FlushMemtable(db.mem, path); err != nil {
+		return err
+	}
+
+	// The SSTable is durable on disk the instant the rename above
+	// succeeds, but it isn't yet *part of the database* -- Open only
+	// ever trusts the MANIFEST-reconstructed set (§7), not a directory
+	// scan. Appending this edit (fsync'd) is what actually commits the
+	// flush. A crash between the rename and this line leaves the file
+	// orphaned: harmless, since it's ignored on the next Open (not
+	// deleted -- see openSSTables) and every key it held is still
+	// recoverable via WAL replay, because RemoveSegmentsBefore below
+	// hasn't run yet at that point either.
+	if err := manifest.AppendEdit(db.manifestPath, manifest.VersionEdit{
+		Type: manifest.SSTableAdded,
+		File: filepath.Base(path),
+	}); err != nil {
 		return err
 	}
 
