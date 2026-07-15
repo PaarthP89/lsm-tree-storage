@@ -305,6 +305,98 @@ func TestOpenFailsLoudlyWhenManifestListsMissingSSTable(t *testing.T) {
 	}
 }
 
+// TestOpenRepairsTornManifestTailBeforeAcceptingNewFlushes injects the
+// crash scenario manifest.RepairTornTail exists to fix: a real flush
+// commits one valid MANIFEST edit, then a second AppendEdit is
+// interrupted mid-write (simulated by writing a truncated record
+// directly, bypassing AppendEdit), leaving the actual on-disk MANIFEST
+// this DB uses with a torn tail. Without repairing that tail before any
+// future AppendEdit, a subsequent real flush's edit would land at a
+// byte-misaligned offset and become permanently unreadable -- silently
+// losing track of that SSTable on every future restart, forever. This
+// confirms Open repairs the tail first, so a real flush performed after
+// reopening is correctly tracked and survives yet another restart.
+func TestOpenRepairsTornManifestTailBeforeAcceptingNewFlushes(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db.SetFlushThreshold(1)
+
+	if err := db.Put([]byte("key:000001"), []byte("gen1")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if len(db.sstables) != 1 {
+		t.Fatalf("got %d SSTables, want 1", len(db.sstables))
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	manifestName, err := manifest.ReadCurrent(dir)
+	if err != nil {
+		t.Fatalf("ReadCurrent: %v", err)
+	}
+	manifestPath := filepath.Join(dir, manifestName)
+
+	// Simulate a crash mid-AppendEdit: append a truncated record
+	// directly onto the real MANIFEST this DB uses.
+	torn := manifest.EncodeEdit(manifest.VersionEdit{Type: manifest.SSTableAdded, File: "000099.sst"})
+	torn = torn[:len(torn)-3]
+	f, err := os.OpenFile(manifestPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	if _, err := f.Write(torn); err != nil {
+		t.Fatalf("Write torn: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open (after simulated torn manifest tail): %v", err)
+	}
+	if len(db2.sstables) != 1 {
+		t.Fatalf("got %d SSTables after repair, want 1 (the pre-crash flush)", len(db2.sstables))
+	}
+
+	// A real flush after the repaired Open must be durably, correctly
+	// tracked -- this is the actual proof that repair worked, not just
+	// that Open didn't error.
+	db2.SetFlushThreshold(1)
+	if err := db2.Put([]byte("key:000002"), []byte("gen2")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if len(db2.sstables) != 2 {
+		t.Fatalf("got %d SSTables after post-repair flush, want 2", len(db2.sstables))
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db3, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open (final restart): %v", err)
+	}
+	defer db3.Close()
+
+	if len(db3.sstables) != 2 {
+		t.Fatalf("got %d SSTables on final restart, want 2 -- the post-repair flush must survive its own restart", len(db3.sstables))
+	}
+
+	v, found, err := db3.Get([]byte("key:000001"))
+	if err != nil || !found || !bytes.Equal(v, []byte("gen1")) {
+		t.Fatalf("Get(key:000001) = %q found=%v err=%v, want gen1 true nil", v, found, err)
+	}
+	v, found, err = db3.Get([]byte("key:000002"))
+	if err != nil || !found || !bytes.Equal(v, []byte("gen2")) {
+		t.Fatalf("Get(key:000002) = %q found=%v err=%v, want gen2 true nil", v, found, err)
+	}
+}
+
 // TestOpenCreatesCurrentAndManifestOnFreshDB confirms a brand-new
 // database durably records CURRENT pointing at an initial MANIFEST on
 // its very first Open, even before any flush happens.

@@ -70,6 +70,15 @@ func Open(dir string) (*DB, error) {
 	}
 	manifestPath := filepath.Join(dir, manifestName)
 
+	// Must run before any future AppendEdit call against this file (the
+	// first of which happens on the next flush, not here) -- see
+	// manifest.RepairTornTail's doc comment for why a torn tail left by
+	// a crash mid-append must be truncated away now, rather than left
+	// for a later AppendEdit to silently write past.
+	if err := manifest.RepairTornTail(manifestPath); err != nil {
+		return nil, err
+	}
+
 	edits, err := manifest.ReplayManifest(manifestPath)
 	if err != nil {
 		return nil, err

@@ -47,6 +47,67 @@ func AppendEdit(manifestPath string, edit VersionEdit) error {
 	return nil
 }
 
+// RepairTornTail truncates manifestPath back to the end of its last
+// fully valid, checksummed record, discarding any trailing torn or
+// corrupt bytes. Callers must call this once, at Open time, before any
+// future AppendEdit call against this file.
+//
+// This exists for the same reason wal.ErrTornSegment exists: appending
+// past a torn tail would make the newly appended record permanently
+// unreachable, since ReplayManifest -- like wal.Replay -- never looks
+// past the first torn record it finds. wal solves this by always
+// resuming writes on a brand-new segment after a crash (see
+// wal.NextSegmentPath); a MANIFEST in this phase has no such escape
+// hatch, since manifest rotation isn't in scope (§9/§11) and there's
+// exactly one long-lived MANIFEST file for the database's whole life.
+// The only fix that fits within that constraint is removing the torn
+// bytes themselves -- which is always safe, because a torn tail is by
+// definition a write that never completed, so nothing durably
+// acknowledged is lost by discarding it (identical reasoning to
+// ReplayManifest's own "stop, don't error" contract).
+func RepairTornTail(manifestPath string) error {
+	f, err := os.OpenFile(manifestPath, os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("manifest: open %s: %w", manifestPath, err)
+	}
+	defer f.Close()
+
+	var validEnd int64
+	for {
+		_, err := DecodeEdit(f)
+		if err == io.EOF || err == ErrCorrupt {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("manifest: %s: %w", manifestPath, err)
+		}
+		pos, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("manifest: %s: %w", manifestPath, err)
+		}
+		validEnd = pos
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("manifest: stat %s: %w", manifestPath, err)
+	}
+	if info.Size() == validEnd {
+		return nil
+	}
+
+	if err := f.Truncate(validEnd); err != nil {
+		return fmt.Errorf("manifest: truncate %s: %w", manifestPath, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("manifest: fsync %s: %w", manifestPath, err)
+	}
+	return nil
+}
+
 // ReplayManifest reads every edit in the MANIFEST file at manifestPath, in
 // order, stopping cleanly at that file's first torn or corrupt record --
 // no error, just everything decoded before the tear -- same torn-tail
