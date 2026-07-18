@@ -159,3 +159,53 @@ func (s *SSTable) Get(key []byte) (value []byte, found bool, tombstone bool, err
 		}
 	}
 }
+
+// Iterator returns a sorted iterator over every entry in the table
+// (tombstones included), scanning the data section from its start up to
+// the footer. This is a genuine full-file scan -- unlike Get, which is
+// deliberately bounded to one sparse-index block -- but that's exactly
+// what compaction's k-way merge needs: every entry, in order, from every
+// input table.
+func (s *SSTable) Iterator() *Iterator {
+	sr := io.NewSectionReader(s.file, 0, s.footerOffset)
+	return &Iterator{path: s.path, br: bufio.NewReader(sr)}
+}
+
+// Iterator walks an SSTable's data section in key order. Unlike Get, a
+// mid-scan decode failure is not "stop, return what we have" (the torn-
+// tail rule that applies to the WAL and MANIFEST, both of which expect an
+// in-progress write at their live tail) -- an SSTable only ever becomes
+// visible via a completed, fsynced atomic rename (see FlushMemtable), so a
+// decode error here can only mean real bit rot in an already-committed
+// file. Next stops and records the error in Err() rather than silently
+// treating corruption as end-of-table; callers (e.g. compaction.Compact)
+// must check Err() after draining.
+type Iterator struct {
+	path string
+	br   *bufio.Reader
+	cur  wal.Entry
+	err  error
+}
+
+// Next advances to the next entry, returning false at true end-of-table
+// or after a decode error (distinguish the two via Err()).
+func (it *Iterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	e, err := wal.DecodeEntry(it.br)
+	if err == io.EOF {
+		return false
+	}
+	if err != nil {
+		it.err = fmt.Errorf("sstable: %s: %w", it.path, err)
+		return false
+	}
+	it.cur = e
+	return true
+}
+
+func (it *Iterator) Key() []byte     { return it.cur.Key }
+func (it *Iterator) Value() []byte   { return it.cur.Value }
+func (it *Iterator) Tombstone() bool { return it.cur.Op == wal.OpDelete }
+func (it *Iterator) Err() error      { return it.err }

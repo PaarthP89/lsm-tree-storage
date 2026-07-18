@@ -50,15 +50,39 @@ var fsyncDir = func(dir string) error {
 	return d.Sync()
 }
 
+// entryIterator is the minimal shape a sorted entry stream needs for
+// FlushIterator to consume it: exactly memtable.Iterator's method set,
+// but declared independently (rather than imported) so anything sorted --
+// a memtable's iterator, compaction's merge iterator, a test's in-memory
+// stand-in -- can be written out without that caller needing to implement
+// or import an unrelated package's interface. Unexported since callers
+// never need to name the type, only structurally satisfy it.
+type entryIterator interface {
+	Next() bool
+	Key() []byte
+	Value() []byte
+	Tombstone() bool
+}
+
 // FlushMemtable writes m's entries, in the sorted order m's Iterator
-// produces, to a new SSTable file. Records reuse wal's entry wire format
+// produces, to a new SSTable file. It's a thin wrapper over FlushIterator
+// for the common case of flushing a live memtable.
+func FlushMemtable(m memtable.Memtable, path string) (*SSTableMeta, error) {
+	return FlushIterator(m.Iterator(), path)
+}
+
+// FlushIterator writes it's entries, which must already be in sorted key
+// order, to a new SSTable file. Records reuse wal's entry wire format
 // exactly (same [checksum][op][key][value] encoding as the WAL) -- one
 // format, two files, not two formats to keep in sync.
 //
 // The file is written at path+".tmp", fsynced, then atomically renamed to
 // path. A crash at any point before the rename leaves at most an orphan
-// .tmp file and never a partially-written file at the final path.
-func FlushMemtable(m memtable.Memtable, path string) (*SSTableMeta, error) {
+// .tmp file and never a partially-written file at the final path. This is
+// the same write path both a memtable flush (FlushMemtable) and
+// compaction's merged output (compaction.Compact) go through, so both get
+// identical crash-safety guarantees for free.
+func FlushIterator(it entryIterator, path string) (*SSTableMeta, error) {
 	tmpPath := path + ".tmp"
 
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -79,7 +103,6 @@ func FlushMemtable(m memtable.Memtable, path string) (*SSTableMeta, error) {
 		count  int
 	)
 
-	it := m.Iterator()
 	for it.Next() {
 		key := it.Key()
 

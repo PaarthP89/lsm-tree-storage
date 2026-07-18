@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/paarthsiphone/lsm-tree-storage/compaction"
 	"github.com/paarthsiphone/lsm-tree-storage/manifest"
 	"github.com/paarthsiphone/lsm-tree-storage/memtable"
 	"github.com/paarthsiphone/lsm-tree-storage/sstable"
@@ -23,6 +24,12 @@ const (
 	// SetFlushThreshold, mainly so tests can force a flush without
 	// writing megabytes of data.
 	defaultFlushThreshold = 4 * 1024 * 1024
+
+	// compactionTriggerThreshold is the live SSTable count past which
+	// MaybeCompact merges every current table into one. Single-level,
+	// "merge everything periodically" per CLAUDE.md §3/§7 -- a size-ratio
+	// multi-level trigger is out of scope (8d, stretch).
+	compactionTriggerThreshold = 4
 )
 
 // DB is the embedded engine's public API.
@@ -306,6 +313,19 @@ func (db *DB) maybeFlush() error {
 		return err
 	}
 
+	// Open (and thus fully footer-checksum-verify) the file we just wrote
+	// *before* the MANIFEST ever calls it live. If this fails -- a freak
+	// failure, since the file was just written and fsynced moments ago
+	// by the FlushMemtable call directly above -- the WAL segment(s)
+	// covering this data are still fully intact on disk (RemoveSegmentsBefore
+	// hasn't run yet), and no MANIFEST edit has been written yet either, so
+	// db.sstables/the MANIFEST are left exactly as they were: nothing to
+	// undo, nothing recorded as live that isn't safely openable.
+	st, err := sstable.OpenSSTable(path)
+	if err != nil {
+		return err
+	}
+
 	// The SSTable is durable on disk the instant the rename above
 	// succeeds, but it isn't yet *part of the database* -- Open only
 	// ever trusts the MANIFEST-reconstructed set (§7), not a directory
@@ -319,11 +339,7 @@ func (db *DB) maybeFlush() error {
 		Type: manifest.SSTableAdded,
 		File: filepath.Base(path),
 	}); err != nil {
-		return err
-	}
-
-	st, err := sstable.OpenSSTable(path)
-	if err != nil {
+		st.Close()
 		return err
 	}
 	db.nextSeq++
@@ -363,7 +379,103 @@ func (db *DB) maybeFlush() error {
 		return err
 	}
 
-	return nil
+	return db.MaybeCompact()
+}
+
+// MaybeCompact merges every currently-live SSTable into one new table if
+// their count exceeds compactionTriggerThreshold; otherwise it's a no-op.
+// Called synchronously after every flush (a simpler synchronous check,
+// per the Phase 6 brief, rather than a background ticker -- there's no
+// concurrent access to race against yet, see the "DB is not safe for
+// concurrent use" note in CLAUDE.md §11).
+//
+// The MANIFEST sequence is deliberately ADDED (the new merged file) before
+// REMOVED (every input file), each individually fsync'd. Naively doing it
+// the other way risks a real data-loss window: a crash between REMOVED
+// (inputs) and ADDED (output) would leave the reconstructed SSTable set
+// with no record of that data at all. ADDED-then-REMOVED instead risks
+// only redundancy on a crash in the gap -- both old and new files end up
+// live, which newest-wins read logic handles correctly -- never data
+// loss. See compaction.Compact's doc comment and CLAUDE.md §7/§8.
+func (db *DB) MaybeCompact() error {
+	if len(db.sstables) <= compactionTriggerThreshold {
+		return nil
+	}
+
+	inputs := append([]*sstable.SSTable(nil), db.sstables...)
+	seq := db.nextSeq
+	outPath := sstablePath(db.dir, seq)
+
+	if _, err := compaction.Compact(inputs, outPath); err != nil {
+		return err
+	}
+
+	// Open (and thus fully footer-checksum-verify) the merged output
+	// *before* either MANIFEST edit runs -- deliberately earlier than
+	// maybeFlush's own crash-orphan window comment below might suggest.
+	// For a flush, a freak post-write open failure still leaves the data
+	// recoverable via the WAL (not yet cleaned up at that point). Here
+	// there is no such backstop: once the REMOVED edits below commit, the
+	// old inputs' data has no other surviving copy anywhere (that's the
+	// entire premise tombstone GC and single-level compaction rely on).
+	// So this must succeed *before* we ever tell the MANIFEST the old
+	// generation is retired, not after -- an unrecoverable data-loss
+	// window otherwise, not just a redundant/orphaned-but-harmless one.
+	newTable, err := sstable.OpenSSTable(outPath)
+	if err != nil {
+		return err
+	}
+
+	// This is the moment the merge is actually committed: any crash
+	// before this line leaves outPath as a harmless, fully-valid but
+	// unreferenced file (ignored on the next Open, exactly like a flush
+	// orphaned between rename and MANIFEST append -- see maybeFlush).
+	if err := manifest.AppendEdit(db.manifestPath, manifest.VersionEdit{
+		Type: manifest.SSTableAdded,
+		File: filepath.Base(outPath),
+	}); err != nil {
+		newTable.Close()
+		return err
+	}
+	for _, in := range inputs {
+		if err := manifest.AppendEdit(db.manifestPath, manifest.VersionEdit{
+			Type: manifest.SSTableRemoved,
+			File: filepath.Base(in.Meta().Path),
+		}); err != nil {
+			newTable.Close()
+			return err
+		}
+	}
+
+	db.nextSeq = seq + 1
+	db.sstables = []*sstable.SSTable{newTable}
+
+	// Both MANIFEST edits above are already durable, so every input is
+	// now provably retired from the database's authoritative state on
+	// this (non-crash) success path -- closing and deleting them here is
+	// pure cleanup, not a correctness requirement. Only the *post-crash*
+	// cleanup of files left behind by an actual mid-compaction crash
+	// (compaction crash-injection scenario 4: ADDED committed, REMOVED
+	// never ran) is out of scope for this phase, per the Phase 6 brief --
+	// those files just sit around as harmless, provably-correct
+	// redundancy until a future compaction sweeps them up too.
+	// Close (and then remove) every input regardless of an earlier one
+	// failing -- same "attempt all, keep the first error" pattern as
+	// DB.Close, so one bad file handle can't leak the rest of this
+	// generation's descriptors or leave later files undeleted.
+	var firstErr error
+	for _, in := range inputs {
+		if err := in.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for _, in := range inputs {
+		if err := os.Remove(in.Meta().Path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
 }
 
 // Get returns the most recent value for key. found is false both when
