@@ -25,7 +25,7 @@ func manifestHasAnyRemoved(edits []manifest.VersionEdit) bool {
 
 // TestCompactionTriggerFiresAutomatically confirms MaybeCompact's
 // post-flush wiring actually engages once the live SSTable count exceeds
-// compactionTriggerThreshold, without any test calling MaybeCompact
+// db.compactionThreshold, without any test calling MaybeCompact
 // directly -- purely from ordinary Put traffic through a small flush
 // threshold.
 func TestCompactionTriggerFiresAutomatically(t *testing.T) {
@@ -44,8 +44,8 @@ func TestCompactionTriggerFiresAutomatically(t *testing.T) {
 		}
 	}
 
-	if len(db.sstables) > compactionTriggerThreshold {
-		t.Fatalf("live SSTable count = %d, want <= %d (compaction should have fired at least once)", len(db.sstables), compactionTriggerThreshold)
+	if len(db.sstables) > db.compactionThreshold {
+		t.Fatalf("live SSTable count = %d, want <= %d (compaction should have fired at least once)", len(db.sstables), db.compactionThreshold)
 	}
 
 	edits, err := manifest.ReplayManifest(db.manifestPath)

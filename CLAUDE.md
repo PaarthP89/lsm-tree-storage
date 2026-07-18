@@ -247,9 +247,11 @@ useful once Target tier is done.
 
 ## 11. Status — UPDATE THIS EVERY SESSION
 
-**Current phase:** Phase 7 — Benchmarks + wrap-up (not yet started)
-**Last completed phase:** Phase 6 — Compaction (k-way merge, tombstone GC,
-crash-safe MANIFEST ordering; completes Target tier)
+**Current phase:** None — Phase 7 complete. Next up is picking a stretch
+phase (8a–8d), user's choice.
+**Last completed phase:** Phase 7 — Benchmarks + wrap-up (real benchmark
+numbers, extended chaos run with compaction inside the crash window,
+README, chaos-report update; completes Target tier end-to-end)
 
 Full narrative history (review-pass-by-review-pass findings, exact test
 counts, timings) lives in git history, not here — this table keeps only
@@ -263,7 +265,7 @@ what a future session needs and can't just re-derive from the code.
 | 4 — Crash-Safe Metadata | Done | `manifest` package (`VersionEdit`, `AppendEdit`, `ReplayManifest`, `ReconstructSSTableSet`) + `CURRENT` read/write, same temp-file→fsync→rename discipline as elsewhere. `DB.Open` follows the locked CURRENT→MANIFEST→SSTables→WAL→memtable order. A MANIFEST-listed-but-missing SSTable fails loudly at `Open` rather than being silently dropped. MANIFEST torn-tail repair happens before any append (`manifest.RepairTornTail` — this is the §8 long-lived-file invariant). |
 | 5 — Chaos Test | Done | `cmd/chaosworker` + `cmd/chaos`: real-subprocess SIGKILL harness, ACK-line-on-stdout is the sole ground truth for "durably acknowledged." Verifies the full key range past the ACK boundary, not just up to it. 20/20 real runs clean, 0 lost/corrupt — see `docs/chaos-report.md` (includes the check confirming Go's Darwin `fsync` issues `F_FULLFSYNC`, so it's real durability, not a platform gap). `SkipList.Get` returns a copy of the value, not an alias into internal storage. |
 | 6 — Compaction | Done | New `compaction` package: `MergeIterator` (heap-based k-way merge, newest source wins ties) + a tombstone-dropping wrapper (safe only because compaction is single-level — see §8). `DB.MaybeCompact` triggers synchronously once live SSTable count exceeds 4; MANIFEST edits appended ADDED-before-REMOVED; old inputs closed/deleted on success. The new compacted output is opened and verified *before* the MANIFEST edits retiring its inputs are committed — verifying after would risk real, permanent data loss if the just-written file were corrupt (its inputs' WAL backing is long gone by compaction time, unlike a flush). |
-| 7 — Benchmarks + wrap-up | Not started | |
+| 7 — Benchmarks + wrap-up | Done | `bench_test.go`: `BenchmarkWrite` (369 ops/sec, fsync-bound by design), `BenchmarkReadHot` (458k ops/sec, pure memtable), `BenchmarkReadCold` (58.7k ops/sec, 13 uncompacted SSTables), `BenchmarkReadAfterCompaction` (76.6k ops/sec, 1 SSTable) — real numbers from `go test -bench=. -benchtime=2000x`, see README. Extended `cmd/chaos` run (25 iterations, `-compactionthreshold=3`, 40,460 acked writes, 0 lost/corrupt) puts compaction's crash windows inside a real randomized `SIGKILL`, not just Phase 6's four hand-injected unit tests — confirmed by inspecting a kept iteration's MANIFEST (98 ADDED/96 REMOVED edits from one burst). Also re-verified, by reading the actual Go 1.26.5 toolchain source (`internal/poll/fd_fsync_darwin.go`), that the Phase 5 F_FULLFSYNC claim still holds on this toolchain. No correctness bugs found by this phase's benchmarking or extended chaos work. |
 | 8a — Bloom filters | Not started (stretch) | |
 | 8b — Range queries | Not started (stretch) | |
 | 8c — Concurrent readers/writers | Not started (stretch) | |
@@ -308,6 +310,13 @@ nothing in §3–§7 has changed):
   existing `manifest`-separate-from-`sstable` precedent).
 - `DB.MaybeCompact() error`: new public method beyond §6's listed `DB`
   signatures, needed to make the LOCKED §7 compaction algorithm reachable.
+- `DB.SetCompactionThreshold(int)`: new public method (Phase 7), mirrors
+  `SetFlushThreshold`. The live-SSTable-count compaction trigger was
+  previously a hardcoded package constant with no override, which meant
+  nothing (test or harness) could force compaction to fire on a
+  realistic-but-small dataset. Needed so `cmd/chaos`/`cmd/chaosworker`
+  could put compaction inside a randomized real-`SIGKILL` crash window
+  (`-compactionthreshold` flag on both).
 - `cmd/lsmload`, `cmd/chaosworker`, `cmd/chaos`, `internal/chaosdata`:
   test/harness-only binaries, not part of the library's public interface.
 

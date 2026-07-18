@@ -19,6 +19,7 @@ func main() {
 	dir := flag.String("dir", "", "data directory")
 	count := flag.Int("count", 5000, "number of puts to attempt")
 	flushThreshold := flag.Int("flushthreshold", 4096, "memtable flush threshold in bytes")
+	compactionThreshold := flag.Int("compactionthreshold", 4, "live SSTable count that triggers compaction")
 	flag.Parse()
 
 	if *dir == "" {
@@ -32,6 +33,7 @@ func main() {
 		os.Exit(1)
 	}
 	db.SetFlushThreshold(*flushThreshold)
+	db.SetCompactionThreshold(*compactionThreshold)
 
 	for i := 0; i < *count; i++ {
 		if err := db.Put(chaosdata.Key(i), chaosdata.Value(i)); err != nil {

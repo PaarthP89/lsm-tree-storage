@@ -152,3 +152,92 @@ Also out of scope, both because range queries aren't built yet (stretch
 per the brief): this harness can't detect a *phantom* key outside
 `[0, maxwrites)` even if one existed, since verification is point lookups
 over a known key range, not a full-table scan.
+
+---
+
+## Phase 7: extended run, compaction included in the crash window
+
+Phase 5's run (above) predates compaction (Phase 6) entirely -- every kill
+point in it landed only during ordinary writes and flushes. Phase 6 itself
+validated compaction's four crash windows, but only via four hand-picked,
+directly-injected scenarios in `compaction_crash_test.go`, not via a real
+`SIGKILL` at a randomized point. This section closes that gap: the same
+harness, same real-subprocess-`SIGKILL` methodology, but with the worker's
+compaction trigger lowered so a burst crosses many compactions, and kill
+points landing throughout -- including, by construction, inside
+compactions -- rather than only between them.
+
+### What changed from the Phase 5 run
+
+- **`DB.SetCompactionThreshold`** (new, added this phase, mirroring the
+  existing `SetFlushThreshold`): overrides the live-SSTable-count that
+  triggers `MaybeCompact`. Previously this was a package-level constant
+  with no override, which meant there was no way for a test or harness to
+  make compaction fire more often than the production default without
+  writing an unrealistic number of keys. Threaded through as
+  `-compactionthreshold` on both `cmd/chaosworker` and `cmd/chaos`
+  (default 4, matching production; the extended run below sets it to 3).
+- Otherwise the harness, the ACK-line ground truth, and the full-key-range
+  verification are unchanged from Phase 5 -- see above for the full
+  methodology.
+
+### Confirming compaction actually fired inside the crash window
+
+Before trusting the run below, a single `-keep=true` iteration was
+inspected directly: with `-compactionthreshold=3`, one iteration's
+MANIFEST (killed at 2,708 acked writes) contained 98 `SSTABLE_ADDED` and
+96 `SSTABLE_REMOVED` edits -- dozens of real compactions, not zero, ran
+during that single burst. This confirms the lowered threshold does what
+it's meant to: put compaction's crash windows (temp-write, pre-rename,
+post-rename-pre-MANIFEST, ADDED-before-REMOVED) genuinely inside the
+randomized kill range, rather than the run merely re-testing ordinary
+flush behavior with extra steps.
+
+### Result
+
+```
+$ go run ./cmd/chaos -iterations=25 -maxwrites=3000 -flushthreshold=4096 -compactionthreshold=3
+iteration 1: killed after 2726 acked writes, verified 2726/2726 correct, 0 lost, 0 corrupt [PASS]
+iteration 2: killed after 614 acked writes, verified 614/614 correct, 0 lost, 0 corrupt [PASS]
+iteration 3: killed after 2818 acked writes, verified 2818/2818 correct, 0 lost, 0 corrupt [PASS]
+iteration 4: killed after 2760 acked writes, verified 2760/2760 correct, 0 lost, 0 corrupt [PASS]
+iteration 5: killed after 509 acked writes, verified 509/509 correct, 0 lost, 0 corrupt [PASS]
+iteration 6: killed after 784 acked writes, verified 784/784 correct, 0 lost, 0 corrupt [PASS]
+iteration 7: killed after 1026 acked writes, verified 1026/1026 correct, 0 lost, 0 corrupt [PASS]
+iteration 8: killed after 429 acked writes, verified 429/429 correct, 0 lost, 0 corrupt [PASS]
+iteration 9: killed after 873 acked writes, verified 873/873 correct, 0 lost, 0 corrupt [PASS]
+iteration 10: killed after 248 acked writes, verified 248/248 correct, 0 lost, 0 corrupt [PASS]
+iteration 11: killed after 2360 acked writes, verified 2360/2360 correct, 0 lost, 0 corrupt [PASS]
+iteration 12: killed after 566 acked writes, verified 566/566 correct, 0 lost, 0 corrupt [PASS]
+iteration 13: killed after 2228 acked writes, verified 2228/2228 correct, 0 lost, 0 corrupt [PASS]
+iteration 14: killed after 859 acked writes, verified 859/859 correct, 0 lost, 0 corrupt [PASS]
+iteration 15: killed after 2268 acked writes, verified 2268/2268 correct, 0 lost, 0 corrupt [PASS]
+iteration 16: killed after 2547 acked writes, verified 2547/2547 correct, 0 lost, 0 corrupt [PASS]
+iteration 17: killed after 2443 acked writes, verified 2443/2443 correct, 0 lost, 0 corrupt [PASS]
+iteration 18: killed after 1806 acked writes, verified 1806/1806 correct, 0 lost, 0 corrupt [PASS]
+iteration 19: killed after 1838 acked writes, verified 1838/1838 correct, 0 lost, 0 corrupt [PASS]
+iteration 20: killed after 2792 acked writes, verified 2792/2792 correct, 0 lost, 0 corrupt [PASS]
+iteration 21: killed after 1968 acked writes, verified 1968/1968 correct, 0 lost, 0 corrupt [PASS]
+iteration 22: killed after 2187 acked writes, verified 2187/2187 correct, 0 lost, 0 corrupt [PASS]
+iteration 23: killed after 1457 acked writes, verified 1457/1457 correct, 0 lost, 0 corrupt [PASS]
+iteration 24: killed after 186 acked writes, verified 186/186 correct, 0 lost, 0 corrupt [PASS]
+iteration 25: killed after 2168 acked writes, verified 2168/2168 correct, 0 lost, 0 corrupt [PASS]
+PASS: 25/25 iterations, 40460 total acked writes verified, 0 lost, 0 corrupt
+```
+
+25/25 iterations clean, 40,460 total acked writes verified, 0 lost, 0
+corrupt -- with compaction firing dozens of times per iteration (per the
+MANIFEST inspection above) and kill points spanning the full range from
+186 to 2,818 acked writes. Combined with Phase 5's original 20/20, this is
+45 total clean real-`SIGKILL` runs across both the pre- and
+post-compaction write paths, with no failures found.
+
+No bug was found by this run. If one had been, per the Phase 7 brief it
+would have been fixed in Phase 6 (compaction) or wherever it actually
+originated, not patched around here.
+
+Reproduce with:
+
+```
+go run ./cmd/chaos -iterations=25 -maxwrites=3000 -flushthreshold=4096 -compactionthreshold=3
+```

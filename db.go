@@ -25,11 +25,14 @@ const (
 	// writing megabytes of data.
 	defaultFlushThreshold = 4 * 1024 * 1024
 
-	// compactionTriggerThreshold is the live SSTable count past which
-	// MaybeCompact merges every current table into one. Single-level,
+	// defaultCompactionTriggerThreshold is the live SSTable count past
+	// which MaybeCompact merges every current table into one. Single-level,
 	// "merge everything periodically" per CLAUDE.md §3/§7 -- a size-ratio
-	// multi-level trigger is out of scope (8d, stretch).
-	compactionTriggerThreshold = 4
+	// multi-level trigger is out of scope (8d, stretch). Overridable via
+	// SetCompactionThreshold, mirroring SetFlushThreshold, so tests (and
+	// the Phase 7 chaos harness) can force compaction to fire without
+	// writing an unrealistic number of keys.
+	defaultCompactionTriggerThreshold = 4
 )
 
 // DB is the embedded engine's public API.
@@ -45,7 +48,8 @@ type DB struct {
 	sstables []*sstable.SSTable
 	nextSeq  int
 
-	flushThreshold int
+	flushThreshold      int
+	compactionThreshold int
 }
 
 // Open reconstructs a DB's exact pre-crash state via the fixed recovery
@@ -127,13 +131,14 @@ func Open(dir string) (*DB, error) {
 	}
 
 	return &DB{
-		dir:            dir,
-		w:              w,
-		mem:            mem,
-		manifestPath:   manifestPath,
-		sstables:       sstables,
-		nextSeq:        nextSeq,
-		flushThreshold: defaultFlushThreshold,
+		dir:                 dir,
+		w:                   w,
+		mem:                 mem,
+		manifestPath:        manifestPath,
+		sstables:            sstables,
+		nextSeq:             nextSeq,
+		flushThreshold:      defaultFlushThreshold,
+		compactionThreshold: defaultCompactionTriggerThreshold,
 	}, nil
 }
 
@@ -277,6 +282,14 @@ func (db *DB) SetFlushThreshold(n int) {
 	db.flushThreshold = n
 }
 
+// SetCompactionThreshold overrides the live SSTable count past which
+// MaybeCompact fires. Intended for tests (and the chaos harness) that want
+// to force compaction deterministically without writing an unrealistic
+// number of keys.
+func (db *DB) SetCompactionThreshold(n int) {
+	db.compactionThreshold = n
+}
+
 // Put durably appends the write to the WAL, then applies it to the
 // memtable. The memtable is never mutated unless the WAL append
 // succeeded.
@@ -383,7 +396,7 @@ func (db *DB) maybeFlush() error {
 }
 
 // MaybeCompact merges every currently-live SSTable into one new table if
-// their count exceeds compactionTriggerThreshold; otherwise it's a no-op.
+// their count exceeds db.compactionThreshold; otherwise it's a no-op.
 // Called synchronously after every flush (a simpler synchronous check,
 // per the Phase 6 brief, rather than a background ticker -- there's no
 // concurrent access to race against yet, see the "DB is not safe for
@@ -398,7 +411,7 @@ func (db *DB) maybeFlush() error {
 // live, which newest-wins read logic handles correctly -- never data
 // loss. See compaction.Compact's doc comment and CLAUDE.md §7/§8.
 func (db *DB) MaybeCompact() error {
-	if len(db.sstables) <= compactionTriggerThreshold {
+	if len(db.sstables) <= db.compactionThreshold {
 		return nil
 	}
 

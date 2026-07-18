@@ -1,11 +1,16 @@
-// Command chaos is the Phase 5 chaos-test harness. Each iteration:
-// launches cmd/chaosworker as a real subprocess, lets it run a burst of
-// writes, SIGKILLs it at a randomized acked-write count, restarts the
-// engine in-process against the same data directory, and verifies that
-// every write the worker actually reported as acked survived with its
-// exact value. See docs/chaos-report.md for a written summary of a real
-// run, and CLAUDE.md §12 for why this uses a real subprocess + real
-// SIGKILL rather than an in-process crash simulation.
+// Command chaos is the Phase 5 chaos-test harness, extended in Phase 7 to
+// also cover compaction. Each iteration: launches cmd/chaosworker as a real
+// subprocess, lets it run a burst of writes, SIGKILLs it at a randomized
+// acked-write count, restarts the engine in-process against the same data
+// directory, and verifies that every write the worker actually reported as
+// acked survived with its exact value. The worker's compaction threshold is
+// tunable (-compactionthreshold, default 4, same as production) -- Phase 7
+// lowers it so compaction actually fires and falls inside the randomized
+// kill window, exercising Phase 6's crash-injection scenarios under real
+// process termination rather than only the four hand-picked unit-test
+// windows. See docs/chaos-report.md for a written summary of a real run,
+// and CLAUDE.md §12 for why this uses a real subprocess + real SIGKILL
+// rather than an in-process crash simulation.
 package main
 
 import (
@@ -31,6 +36,7 @@ func main() {
 	iterations := flag.Int("iterations", 20, "number of chaos iterations to run")
 	maxWrites := flag.Int("maxwrites", 3000, "upper bound on writes per iteration")
 	flushThreshold := flag.Int("flushthreshold", 4096, "worker memtable flush threshold in bytes, kept small so a burst spans several flushes")
+	compactionThreshold := flag.Int("compactionthreshold", 4, "worker live-SSTable-count compaction trigger, lowered so a burst crosses at least one compaction")
 	keep := flag.Bool("keep", false, "keep each iteration's data directory instead of deleting it")
 	flag.Parse()
 
@@ -50,7 +56,7 @@ func main() {
 
 	var totalAcked, totalLost, totalCorrupt, failedIterations int
 	for iter := 1; iter <= *iterations; iter++ {
-		res, err := runIteration(workerBin, iter, *maxWrites, *flushThreshold, rng, *keep)
+		res, err := runIteration(workerBin, iter, *maxWrites, *flushThreshold, *compactionThreshold, rng, *keep)
 		if err != nil {
 			fmt.Printf("iteration %d: FAILED to run: %v\n", iter, err)
 			failedIterations++
@@ -95,7 +101,7 @@ type iterationResult struct {
 // ACK line really read from the worker's stdout, since a few extra
 // writes may land (and print) in the gap between the target being hit and
 // the SIGKILL actually stopping the process.
-func runIteration(workerBin string, iter, maxWrites, flushThreshold int, rng *rand.Rand, keep bool) (iterationResult, error) {
+func runIteration(workerBin string, iter, maxWrites, flushThreshold, compactionThreshold int, rng *rand.Rand, keep bool) (iterationResult, error) {
 	dir, err := os.MkdirTemp("", fmt.Sprintf("lsmchaos-iter%d-", iter))
 	if err != nil {
 		return iterationResult{}, err
@@ -108,6 +114,7 @@ func runIteration(workerBin string, iter, maxWrites, flushThreshold int, rng *ra
 		"-dir", dir,
 		"-count", strconv.Itoa(maxWrites),
 		"-flushthreshold", strconv.Itoa(flushThreshold),
+		"-compactionthreshold", strconv.Itoa(compactionThreshold),
 	)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

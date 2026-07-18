@@ -14,7 +14,7 @@ import (
 // setupNSSTables opens a fresh DB at dir, writes just enough sequential
 // keys (keyFor(0)..keyFor(total-1), all distinct, no overwrites) with a
 // small flush threshold to produce exactly wantTables real SSTables, then
-// closes it. wantTables must stay at or below compactionTriggerThreshold
+// closes it. wantTables must stay at or below db.compactionThreshold
 // so no compaction fires during setup -- these tests inject one specific
 // mid-compaction crash point themselves, rather than relying on (or
 // racing) the automatic trigger.
