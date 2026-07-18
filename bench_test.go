@@ -58,8 +58,8 @@ func BenchmarkReadHot(b *testing.B) {
 			b.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	if len(db.sstables) != 0 {
-		b.Fatalf("setup flushed %d SSTables, want 0 (hot reads must hit only the memtable)", len(db.sstables))
+	if len(db.liveSSTables()) != 0 {
+		b.Fatalf("setup flushed %d SSTables, want 0 (hot reads must hit only the memtable)", len(db.liveSSTables()))
 	}
 
 	rng := rand.New(rand.NewSource(1))
@@ -77,7 +77,7 @@ func BenchmarkReadHot(b *testing.B) {
 // BenchmarkReadCold measures Get latency against keys that live only on
 // disk, spread across many *uncompacted* SSTables (compaction threshold set
 // far out of reach) -- the worst case for the read path, since Get walks
-// db.sstables newest-to-oldest and an early-written key can require
+// every live L0 file newest-to-oldest and an early-written key can require
 // consulting many tables (each its own sparse-index binary search + bounded
 // scan) before it's found.
 func BenchmarkReadCold(b *testing.B) {
@@ -97,10 +97,10 @@ func BenchmarkReadCold(b *testing.B) {
 			b.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	if len(db.sstables) < 2 {
-		b.Fatalf("setup produced %d SSTables, want several (cold reads need a real uncompacted set)", len(db.sstables))
+	if len(db.liveSSTables()) < 2 {
+		b.Fatalf("setup produced %d SSTables, want several (cold reads need a real uncompacted set)", len(db.liveSSTables()))
 	}
-	b.Logf("ReadCold setup: %d SSTables, uncompacted", len(db.sstables))
+	b.Logf("ReadCold setup: %d SSTables, uncompacted", len(db.liveSSTables()))
 
 	rng := rand.New(rand.NewSource(2))
 	b.ResetTimer()
@@ -138,10 +138,10 @@ func BenchmarkReadAfterCompaction(b *testing.B) {
 			b.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	if len(db.sstables) == 0 {
+	if len(db.liveSSTables()) == 0 {
 		b.Fatalf("setup produced no SSTables")
 	}
-	b.Logf("ReadAfterCompaction setup: %d SSTables, compacted", len(db.sstables))
+	b.Logf("ReadAfterCompaction setup: %d SSTables, compacted", len(db.liveSSTables()))
 
 	rng := rand.New(rand.NewSource(3))
 	b.ResetTimer()

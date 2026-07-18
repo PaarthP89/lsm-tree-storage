@@ -268,17 +268,32 @@ what a future session needs and can't just re-derive from the code.
 | 7 — Benchmarks + wrap-up | Done | `bench_test.go`: `BenchmarkWrite` (369 ops/sec, fsync-bound by design), `BenchmarkReadHot` (458k ops/sec, pure memtable), `BenchmarkReadCold` (58.7k ops/sec, 13 uncompacted SSTables), `BenchmarkReadAfterCompaction` (76.6k ops/sec, 1 SSTable) — real numbers from `go test -bench=. -benchtime=2000x`, see README. Extended `cmd/chaos` run (25 iterations, `-compactionthreshold=3`, 40,460 acked writes, 0 lost/corrupt) puts compaction's crash windows inside a real randomized `SIGKILL`, not just Phase 6's four hand-injected unit tests — confirmed by inspecting a kept iteration's MANIFEST (98 ADDED/96 REMOVED edits from one burst). Also re-verified, by reading the actual Go 1.26.5 toolchain source (`internal/poll/fd_fsync_darwin.go`), that the Phase 5 F_FULLFSYNC claim still holds on this toolchain. No correctness bugs found by this phase's benchmarking or extended chaos work. |
 | 8a — Bloom filters | Implemented — pending human review | New self-describing footer section (`sstable`), FNV-1a/Kirsch-Mitzenmacher filter built via a buffered-keys pass in `FlushIterator` (flush and compaction both, no special-casing), consulted in `Get` to skip the sparse-index/scan path on a "definitely absent" result. ~20x fewer ns/op on a 100%-miss workload (263 vs 5236 ns/op, Apple M2). Backward-compat with pre-8a files verified against a hand-built pre-8a-format file. Zero false negatives (50k keys), 1.04% observed FPR vs 1% target. See the Deviations/additions entry below for the full footer layout and design rationale. |
 | 8b — Range queries | Implemented — pending human review | `DB.Scan(start, end)` half-open `[start, end)`, newest-wins, tombstone-filtered, built on `compaction.MergeIterator` (unmodified) + new O(log n) seek support in `memtable.SkipList` and bounded-scan seek support in `sstable.SSTable`. Concurrent-mutation-during-Scan left explicitly undefined, deferred to 8c. See the Deviations/additions entry below for the full design. |
-| 8c — Concurrent readers/writers | Not started (stretch) | |
-| 8d — Multi-level compaction | Not started (stretch) | |
+| 8c — Concurrent readers/writers | Implemented — pending human review | `DB`'s mutable state (memtable, WAL writer, L0/L1 SSTable lists) moved into an immutable `dbState` published via `atomic.Pointer[dbState]`; `Get`/`Scan` are fully lock-free (load once, operate on that snapshot). Writes (`Put`/`Delete`, and the flush/compaction either triggers) are serialized by a `writeMu` instead of the brief's suggested bare CAS "elected flusher" guard — deliberate deviation, justified below and in the Deviations list, because a lock-free design isn't actually safe against `memtable.SkipList.Iterator`'s documented "not synchronized with concurrent writes" contract. A real bug *was* found and fixed in-scope while verifying that contract under `-race`: `skipListIterator.Next` walked raw forward pointers with no locking at all, a genuine data race against a concurrent `Put`, now fixed by taking the list's own `RLock` per `Next()` call (see Deviations). `go test -race ./...` clean, including 5 new dedicated concurrency tests (`concurrency_test.go`): no data races, no lost/duplicated writes under concurrent flush churn, correctness + L1 non-overlap invariant under concurrent compaction, and zero read errors from a hammering reader during heavy concurrent compaction (the direct test of the reader-drain-before-close mechanism). `Close` remains explicitly unsafe to call concurrently with any other in-flight call (no draining implemented, per scope). |
+| 8d — Multi-level compaction | Implemented — pending human review | Two-level (L0/L1) compaction: `manifest.VersionEdit` gains a self-describing `Level` field (new wire-type markers, pre-8d records always decode as L0 — see `ReconstructLeveledSSTableSet`); `DB` splits `sstables` into `l0`/`l1`; `compaction.CompactLeveled` takes an explicit `canDropTombstones` bool instead of always dropping; `DB.compactL0ToL1IfNeeded`/`compactL1IfNeeded` are the two independent triggers (`SetL0CompactionThreshold`, `SetL1SizeRatio`); `Get` checks all L0 newest-to-oldest then binary-searches L1 by range. Verified: adversarial tombstone-drop tests (`compaction/leveled_test.go`), L1 non-overlap invariant under repeated compaction (`leveled_compaction_test.go`), and 12/12 real-subprocess-`SIGKILL` iterations mid-L0→L1-merge (`l0l1_crash_subprocess_test.go`), 0 lost/corrupt. **This phase proposes changes to LOCKED §3/§5/§7/§8 — see the "Proposed LOCKED-section changes" block at the end of this section, pending human review; nothing in §1–10/12 has been edited directly.** |
 
 **Known deliberate gaps at current state:**
 
-- **`DB` is not safe for concurrent use.** `maybeFlush` reassigns
-  `db.mem`, `db.sstables`, and `db.w` with no synchronization. Left open
-  rather than patched with a coarse lock, since concurrent
-  readers/writers is stretch phase 8c's own job and a hasty mutex now
-  could conflict with whatever design 8c actually needs (e.g. lock-free
-  reads across a flush's memtable/SSTable-list swap).
+- **~~`DB` is not safe for concurrent use.~~ Resolved by Phase 8c.**
+  `maybeFlush`/`compactL0ToL1IfNeeded`/`compactL1IfNeeded` no longer
+  reassign fields in place; they build a new `dbState` (memtable, WAL
+  writer, L0/L1 lists) and publish it via `db.state.Store`, an
+  `atomic.Pointer[dbState]`. `Get`/`Scan` are lock-free (load the current
+  state once per call); `Put`/`Delete` (and the flush/compaction they can
+  trigger) are serialized against each other by a new `writeMu`. See the
+  8c row above and the Deviations entry below for the full design,
+  including why a bare lock-free CAS guard (the more obvious design) was
+  rejected as unsafe for this codebase's specific memtable implementation.
+  One narrower gap remains, carried forward rather than fully closed: a
+  `Scan` iterator's *safety* is guaranteed only for the duration of the
+  `Scan` call itself (snapshot construction) and for a memtable source
+  indefinitely after (fixed this phase, see Deviations); an SSTable source
+  in a long-lived `Scan` iterator that outlives a *later* compaction
+  retiring that specific file could see a read error from it (never
+  memory corruption or a crash) if the caller keeps pulling from the
+  iterator long after `Scan` returned. Fully closing this would need
+  per-iterator lifecycle tracking (e.g. an explicit `Close` on the
+  returned iterator) — a larger addition flagged for a future phase, not
+  solved speculatively here.
 - **A `Put`/`Delete` that durably succeeds can still return an error** if
   purely post-durability housekeeping fails afterward (WAL segment
   rotation in `Append`; `RemoveSegmentsBefore` at the tail of
@@ -373,10 +388,14 @@ nothing in §3–§7 has changed):
   without constructing anything. Sorted, deduplicated, tombstone-filtered
   across the memtable and every live SSTable, newest-wins on overlap —
   built by reusing `compaction.MergeIterator` unmodified (one
-  `compaction.Source` per source, ranked exactly like `MaybeCompact`
-  already ranks them: memtable rank 0, then `db.sstables` in its existing
-  newest-first order), rather than reimplementing k-way merge/newest-wins
-  resolution a second time. The returned type is `memtable.Iterator` —
+  `compaction.Source` per source, ranked exactly like `Get` already ranks
+  them: memtable rank 0, then `db.l0` in its existing newest-first order,
+  then every `db.l1` file whose range could overlap `[start, end)` —
+  updated by Phase 8d to source from the split `l0`/`l1` fields instead of
+  the original flat `db.sstables`, with no change to `Scan`'s own
+  half-open-range/tombstone-filtering logic), rather than reimplementing
+  k-way merge/newest-wins resolution a second time. The returned type is
+  `memtable.Iterator` —
   the interface already defined in §6, not a new shape — implemented by
   a new unexported `rangeIterator` (in the new file `scan.go`) that wraps
   `MergeIterator` to enforce the `end` bound (which `MergeIterator` has
@@ -407,10 +426,331 @@ nothing in §3–§7 has changed):
 - **Known limitation, deliberately not fixed this phase**: a `Scan`
   iterator's behavior is undefined if the `DB` is mutated (`Put`,
   `Delete`, or a flush/compaction a later `Put`/`Delete` triggers) while
-  that iterator is still in use — `Scan` snapshots `db.mem`/
-  `db.sstables` at call time but holds no lock beyond that. This is the
-  same "`DB` is not safe for concurrent use" gap already on record above;
-  fixing it is Phase 8c's exclusive scope, not this one's.
+  that iterator is still in use — `Scan` snapshots `db.mem`/`db.l0`/`db.l1`
+  at call time but holds no lock beyond that. This is the same "`DB` is
+  not safe for concurrent use" gap already on record above; fixing it is
+  Phase 8c's exclusive scope, not this one's.
+- **Phase 8d (two-level compaction)** additions, all additive beyond
+  §3/§5/§7/§8's *current* LOCKED text — see the "Proposed LOCKED-section
+  changes" block below for the exact replacement text this phase asks a
+  human to review and promote:
+  - `manifest.VersionEdit.Level int`: new field. Wire format adds two new
+    edit-type marker bytes (`wireAddedLeveled`/`wireRemovedLeveled`,
+    values 3/4) alongside the original `wireAddedLegacy`/
+    `wireRemovedLegacy` (values 1/2, unchanged, matching the original
+    exported `SSTableAdded`/`SSTableRemoved` byte values). `EncodeEdit`
+    always writes the leveled form now; `DecodeEdit` reads whichever
+    marker is actually present, so a MANIFEST mixing pre-8d and post-8d
+    records decodes each one correctly on its own — no file-wide version
+    flag needed, the per-record marker byte *is* the version signal (same
+    self-describing spirit as 8a's bloom-section flag, adapted for a
+    continuous record stream where the "read until exhausted" trick 8a
+    used doesn't apply). A pre-8d record always decodes with `Level: 0`.
+  - `manifest.ReconstructLeveledSSTableSet(edits) []LiveSSTable`: new
+    function alongside the original (unchanged) `ReconstructSSTableSet`,
+    additionally tracking each live file's level.
+  - `compaction.CompactLeveled(inputs, outputPath, canDropTombstones bool)`:
+    new function; `Compact` (unchanged signature) is now defined as
+    `CompactLeveled(inputs, outputPath, true)`, preserved for every
+    pre-8d caller that always passes every live SSTable as inputs.
+  - `DB` struct: `sstables []*sstable.SSTable` (flat) replaced by
+    `l0 []*sstable.SSTable` (newest-first, may overlap) and
+    `l1 []*sstable.SSTable` (sorted ascending by `MinKey`, non-overlapping).
+    New unexported `liveSSTables()` helper returns both concatenated, for
+    callers (tests, `Close`) that only care about total live membership.
+  - `DB.SetL0CompactionThreshold(int)`: new method, same role the old
+    `SetCompactionThreshold` played for the single flat level.
+    `SetCompactionThreshold` is kept as an alias calling
+    `SetL0CompactionThreshold`, so `cmd/chaos`/`cmd/chaosworker`/benchmarks
+    keep working unchanged.
+  - `DB.SetL1SizeRatio(int)`: new method controlling the multiple of the
+    L0 flush-size target L1's total on-disk size may reach before a full
+    L1->L1 recompaction fires (default 10, per §3's own rationale).
+  - `DB.MaybeCompact() error`: unchanged signature, now an orchestrator
+    calling two new unexported methods in order,
+    `compactL0ToL1IfNeeded`/`compactL1IfNeeded` — two independent
+    triggers, neither one's inputs ever overlapping the other's.
+  - `findL1TableForKey(l1, key) *sstable.SSTable`: new unexported
+    function (package-level, not a `DB` method as of Phase 8c's snapshot
+    refactor below — it operates on a specific `l1` slice, not `db.l1`
+    directly), the binary search over L1's non-overlapping ranges that
+    makes `Get` check at most one L1 file instead of every one.
+  - Real-subprocess-`SIGKILL` crash coverage extended:
+    `l0l1_crash_subprocess_test.go` reuses `cmd/chaosworker`'s existing
+    ACK-line protocol (no changes needed there — `SetCompactionThreshold`
+    already aliases onto the new L0 trigger) with a small
+    `-compactionthreshold` so a randomized kill lands mid-L0->L1 merge;
+    12/12 iterations, 25,955 total acked writes verified, 0 lost/corrupt,
+    L1 non-overlap invariant checked after every recovery.
+- **Phase 8c (concurrent readers/writers)** additions:
+  - `dbState` (unexported struct: `mem`, `w`, `l0`, `l1`) + `DB.state
+    atomic.Pointer[dbState]`: the entire mutable-state model. Every
+    method that used to reassign `db.mem`/`db.l0`/`db.l1`/`db.w` in place
+    now builds a new `*dbState` and calls `db.state.Store` once, atomically
+    publishing a fully-formed, never-mutated-again snapshot.
+  - `DB.writeMu sync.Mutex`: serializes `Put`/`Delete` (and the
+    flush/compaction either triggers) against each other. **Deliberate
+    deviation from the brief's suggested design**, which called for a
+    lock-free, non-blocking "elected flusher" via a `flushing
+    atomic.Bool` CAS guard. That design is not actually safe against this
+    codebase's specific `memtable.SkipList`: its `Iterator`/`SeekIterator`
+    contract explicitly says traversal "is not synchronized with
+    concurrent writes to the same list," so a bare CAS-elected flush
+    (with no serialization around the memtable insert itself) could let a
+    concurrent `Put`'s insert race invisibly with the winning flusher's
+    `SSTable` write — a write that's WAL-durable but silently absent from
+    both the flushed `SSTable` and (once the old memtable is retired) any
+    live read, a real data-loss bug for a *live* reader, not just a
+    crash-recovery nuance. `writeMu` avoids this by construction: a
+    flush's memtable iterator only ever runs while the same goroutine
+    still holds `writeMu`, so it can never interleave with another
+    goroutine's insert into that same memtable. This trades
+    writer/writer parallelism (Put/Delete calls run one at a time,
+    mirroring LevelDB/RocksDB's own single-active-writer model) for a
+    design that's provably correct against the memtable's actual
+    contract, per this phase's Debug Rule (do not paper over a
+    correctness question with a fancier lock-free scheme under time
+    pressure). `flushing`/`compacting` CAS guards from the brief were
+    correspondingly not added — under `writeMu` they'd be redundant (only
+    one goroutine is ever inside the write/flush/compact path at a time).
+  - `DB.inFlightReaders atomic.Int64` + `DB.drainReaders()`: a `Get` call
+    (whole call) and a `Scan` call (the snapshot-construction portion)
+    increment/decrement this around themselves. Compaction (never
+    flush — a flush's retired memtable needs no such protection, since
+    `writeMu` already guarantees no other writer touches it, and no
+    reader ever touches a `dbState`'s `w` field) calls `drainReaders`
+    after publishing its new state and before closing/removing the
+    `SSTable` files that state just retired, so a `Get`/`Scan` that
+    loaded the *previous* state can never have a file closed out from
+    under it mid-read.
+  - `memtable.SkipList`: **real bug found and fixed in-scope** (per this
+    phase's explicit mandate to verify the memtable's existing
+    `sync.RWMutex` is genuinely sufficient under concurrent access, and
+    fix any gap found). `skipListIterator.Next` previously followed raw
+    `node.forward` pointers with no locking at all after the iterator was
+    constructed — safe only as long as nothing else ever mutated the list
+    while the iterator was in use, which Phase 8c's own `Scan` now
+    violates by design (a long-lived iterator handed to a caller while
+    concurrent `Put`s continue). `go test -race` caught this directly as
+    a real, reproducible data race (not a hypothetical one) the first
+    time a concurrent-`Put`-plus-`Scan` test was run. Fixed by having
+    `Next()` take the list's own `s.mu.RLock()` for the brief moment it
+    reads one node's forward pointer and copies out its key/value/
+    tombstone into the iterator's own fields (`curKey`/`curValue`/
+    `curTombstone`), rather than storing a raw `*node` and dereferencing
+    it lazily later. This is safe even though a node's value/tombstone
+    *can* be overwritten in place by a later `Put` on the same key,
+    because that overwrite always replaces the slice header with a
+    reference to a brand-new cloned array (`cloneBytes`) rather than
+    mutating an existing array's bytes -- a slice header copied out under
+    `RLock` keeps pointing at a backing array that's immutable from that
+    point on, safe to read after the lock is released regardless of what
+    the node is mutated to afterward. Both `Iterator()` and
+    `SeekIterator()` share this fix (both return a `skipListIterator`).
+  - `DB.MaybeCompact() error`: signature unchanged from Phase 8d, but now
+    acquires `writeMu` for its duration (it's just an on-demand path to
+    the same `maybeCompact` flush triggers automatically).
+  - `DB.Close`: doc comment now explicitly states it must not be called
+    concurrently with any other in-flight `DB` method — no
+    graceful-shutdown draining was implemented (out of scope, per the
+    brief).
+  - `concurrency_test.go`: 5 new tests, all passing under `go test -race`:
+    concurrent `Put`/`Get`/`Scan` with no data race; concurrent `Put`s
+    crossing the flush threshold under contention never lose or
+    duplicate a write; concurrent compaction under load preserves
+    correctness and the L1 non-overlap invariant; a dedicated reader
+    hammering a stable key throughout heavy concurrent compaction churn
+    never observes a read error (the direct test of the
+    inFlightReaders/drainReaders mechanism); an in-flight `Get`/`Scan`
+    snapshot remains valid and correct across a concurrent state swap.
+  - **Known limitation carried forward, not fully closed this phase**:
+    `Scan`'s returned iterator is only protected against a racing file
+    close for the duration of the `Scan` call itself (snapshot
+    construction); the memtable source is now safe indefinitely after
+    (see the `skipListIterator` fix above), but an SSTable source in a
+    long-lived iterator that outlives a *later* compaction retiring that
+    specific file could still surface a read error (not a crash or
+    memory corruption) if the caller keeps calling `Next()` long after
+    `Scan` returned. See the "Known deliberate gaps" entry above for the
+    full reasoning and why this is flagged for a future phase rather than
+    solved here.
+
+## Proposed LOCKED-section changes — pending human review
+
+Phase 8d's brief requires genuinely revising §3, §5, §7, and §8. Per this
+project's update protocol, those sections have **not** been edited
+directly — the exact proposed replacement text for each is below, for a
+human to review and manually promote into §3/§5/§7/§8 (replacing the
+cited original text) if accepted.
+
+### Proposed replacement for §3's "Level structure" row
+
+Original row:
+
+> | Level structure | Single flat level for Minimum/Target tier | Multi-level (10x size ratio per level) is real added complexity for marginal value at this scope. Single-level "merge everything periodically" still demonstrates k-way merge, tombstone GC, and atomic rename. Multi-level is a stretch item (8d). |
+
+Proposed replacement:
+
+> | Level structure | Two levels: L0 (freshly-flushed, may overlap) and L1 (compacted, non-overlapping, sized ~10x the L0 flush-size target) | Demonstrates k-way merge, tombstone GC, and atomic rename (same as the original single-level design) plus the two real problems a flat scheme can't: bounding how many files a read must check (L0 still requires checking every file, but L1 doesn't) and giving compaction an amortization lever (L0->L1 stays cheap and frequent; L1->L1 is rarer and bulk). A third+ level (L2, L3, ...) is deliberately out of scope — exactly two levels is the full stretch-tier ask (§9), not a general N-level scheme. |
+
+### Proposed replacement for §5's MANIFEST entry format
+
+Original text:
+
+> ### MANIFEST entry
+> ```
+> [checksum: 4B CRC32][edit_type: 1B][payload...]
+> ```
+> `edit_type` is one of `SSTABLE_ADDED`, `SSTABLE_REMOVED`. Payload is the
+> SSTable filename (length-prefixed). Later, level number, if/when
+> multi-level compaction (8d) is added.
+
+Proposed replacement:
+
+> ### MANIFEST entry
+> ```
+> [checksum: 4B CRC32][edit_type: 1B][name_len: 4B][name][level: 4B, only present for edit_type in {3,4}]
+> ```
+> `edit_type` is one of four values, which double as a wire-format version
+> marker: `1` = `SSTABLE_ADDED` (legacy, pre-8d, no level field — always
+> means level 0), `2` = `SSTABLE_REMOVED` (legacy, same), `3` =
+> `SSTABLE_ADDED` with an explicit trailing level field, `4` =
+> `SSTABLE_REMOVED` with an explicit trailing level field. Every edit
+> written by 8d-or-later code uses `3`/`4`; `1`/`2` only ever appear in a
+> MANIFEST written before this field existed. This lets a single MANIFEST
+> mix pre- and post-8d records (the normal shape of a live database's
+> MANIFEST right after upgrading) and have each one decode correctly on
+> its own, with no file-wide version flag — the per-record `edit_type`
+> byte itself is the version signal. Payload is the SSTable filename
+> (length-prefixed), as before.
+
+### Proposed replacement for §7's read path (step 2) and compaction algorithm
+
+Original text (Read path, step 2):
+
+> 2. If not found, check SSTables newest-to-oldest (order determined by the
+>    MANIFEST's current view) until found or exhausted.
+
+Proposed replacement:
+
+> 2. If not found, check every live L0 file, newest-to-oldest (L0 files may
+>    overlap in key range, so all must be checked until a hit). If still
+>    not found, locate at most one L1 file whose key range could contain
+>    the key — binary search over L1's non-overlapping ranges, sorted
+>    ascending by min key — and check only that one file, never a linear
+>    scan of L1.
+
+Original text (Compaction, single-level, Target tier — the whole
+subsection):
+
+> ### Compaction (single-level, Target tier)
+> 1. Background process periodically merges multiple SSTables into one via
+>    k-way merge (all inputs sorted).
+> 2. During merge: keep only the newest value per key.
+> 3. **Tombstone GC**: because single-level compaction replaces *every*
+>    current SSTable in one pass, there's no older data left underneath the
+>    output — a tombstone that's still the newest entry for its key at the
+>    end of the merge can be dropped from the output entirely. This
+>    assumption breaks under multi-level compaction (8d) and must be
+>    revisited if that's ever built.
+> 4. Write result to a temp file, fsync, atomically rename into place.
+> 5. Append MANIFEST edits as a single durable operation, **in this specific
+>    order: `SSTABLE_ADDED` (new file) before `SSTABLE_REMOVED` (old
+>    files)**. A crash between the two leaves both old and new files live in
+>    the reconstructed set — redundant, but every key's value is still
+>    correct via newest-wins read logic. The reverse order risks a real data
+>    loss window if the crash lands between them. This ordering was derived
+>    during the compaction phase, not stated explicitly in the original
+>    spec — it's binding regardless.
+
+Proposed replacement:
+
+> ### Compaction (two-level, Target+8d tier)
+> Two independent triggers, neither one ever consuming the other's inputs:
+>
+> 1. **L0->L1** fires when the live L0 file count exceeds a threshold
+>    (`SetL0CompactionThreshold`, default 4 — the same value and meaning
+>    the old single-level threshold had). Inputs: every live L0 file, plus
+>    every live L1 file whose key range overlaps the L0 files' combined
+>    range (found by a single-pass check against that combined range — L1's
+>    own non-overlap invariant guarantees no L1 file *outside* that
+>    first-pass check could newly overlap the merge's eventual output
+>    either, so no iterative re-check is needed). K-way merge (all inputs
+>    sorted, newest-to-oldest recency: L0 newest-first, then the
+>    overlapping L1 files, which are always older than any live L0 file).
+>    Output: one new, non-overlapping L1 file.
+> 2. **L1->L1** fires when L1's total on-disk size exceeds a ratio
+>    (`SetL1SizeRatio`, default 10) times the L0 flush-size target — reusing
+>    the 10x figure §3 already named as the multi-level rationale, not a
+>    new number. Inputs: every live L1 file (single-level, "merge
+>    everything," exactly like the original Target-tier scheme, just
+>    scoped to L1). Output: one new L1 file.
+> 3. During either merge: keep only the newest value per key (unchanged).
+> 4. **Tombstone GC, generalized**: dropping a tombstone that's still the
+>    newest entry for its key at the end of a merge is safe *only* when
+>    every source that could hold an older, still-relevant value for that
+>    key was included in the merge — expressed as an explicit
+>    `canDropTombstones` boolean the caller must prove true, never inferred
+>    by the merge itself. For L0->L1, this holds because step 1 always
+>    includes every live L0 file and every L1 file whose range could
+>    overlap the output. For L1->L1, this holds because step 2 always
+>    includes every live L1 file, and no L0 file can hold data *older* than
+>    anything already in L1 (L0 only ever holds freshly flushed, causally
+>    newer data). The original single-level invariant ("compaction replaces
+>    every current SSTable in one pass") is the special case of this rule
+>    where there is only one level to begin with.
+> 5. Write result to a temp file, fsync, atomically rename into place
+>    (unchanged).
+> 6. Append MANIFEST edits as a single durable operation, **`SSTABLE_ADDED`
+>    (new file, tagged with its level) before `SSTABLE_REMOVED` (old
+>    files)** — same ordering rule as before, applied per-compaction
+>    regardless of which level(s) it touches. A crash between the two
+>    leaves both generations live — redundant, never data loss.
+
+### Proposed replacement for §8's tombstone-drop invariant bullet
+
+Original bullet:
+
+> - Tombstone-drop-during-compaction is only valid because compaction is
+>   single-level. Comment this assumption at the point it's implemented.
+
+Proposed replacement:
+
+> - Tombstone-drop-during-compaction is only valid when the merge's inputs
+>   provably cover every source that could hold an older, still-relevant
+>   value for any key the merge touches — expressed as an explicit
+>   `canDropTombstones` boolean passed into the merge, never inferred from
+>   context. Under the original single-level scheme this coverage was
+>   automatic (every live SSTable was always an input). Under two-level
+>   compaction (8d), it's proven per compaction: L0->L1 by always including
+>   every L0 file and every overlapping L1 file; L1->L1 by always including
+>   every L1 file and relying on L0 only ever holding causally newer data
+>   than L1. **Never drop a tombstone unless this is proven true for the
+>   specific merge at hand** — comment the proof at the point it's
+>   implemented, per this bullet's own original convention. Getting this
+>   wrong is a silent data-resurrection bug: a stale value outside the
+>   merge's inputs would incorrectly become visible again once the
+>   tombstone that shadowed it is gone.
+
+### Rationale for the tombstone-drop condition specifically
+
+The single biggest correctness risk in this phase is a tombstone dropped
+without genuine coverage, since the failure mode is silent (a deleted key
+quietly resurfaces with a stale value, with no error or crash to flag it)
+and only manifests later, on a read for that specific key. The design
+above avoids inferring coverage from context (e.g. "L0->L1 compactions are
+always safe" as a blanket rule) and instead requires an explicit boolean
+threaded into `compaction.CompactLeveled` at the call site, with the
+coverage proof written down as a comment next to each of the two call
+sites that pass `true` (`DB.compactL0ToL1IfNeeded`, `DB.compactL1IfNeeded`).
+This makes the invariant something a future change has to actively break
+(e.g. by changing what counts as "overlapping" without updating the
+argument passed here) rather than something that could silently stop
+holding as a side effect of an unrelated refactor. The adversarial test
+suite (`compaction/leveled_test.go`) deliberately constructs the unsafe
+case — incomplete coverage with `canDropTombstones=true` — and shows it
+does resurrect stale data, specifically so this danger is demonstrated
+empirically, not just asserted in a comment.
 
 ## 12. Testing conventions
 
@@ -423,3 +763,44 @@ nothing in §3–§7 has changed):
 - Don't fix a bug found in a later phase's testing by patching around it
   in that phase — fix it in the earlier phase it actually belongs to, and
   re-run that phase's tests too.
+
+## Immediate next steps (as of this session)
+
+Both 8c and 8d are implemented and fully green (`go vet`, `go build`,
+`go test ./...`, `go test -race ./...` — all clean), but **nothing from
+this session is committed yet**. Before picking this back up:
+
+1. **Review and decide on the §3/§5/§7/§8 proposal.** See "Proposed
+   LOCKED-section changes — pending human review" above. If accepted,
+   manually replace the cited original text in §3/§5/§7/§8 with the
+   proposed text, then delete the proposal block and flip the 8d row's
+   status from "Implemented — pending human review" to "Done".
+2. **Review Phase 8c's `writeMu` deviation.** The brief asked for a
+   lock-free "elected flusher" CAS guard; this session used a full
+   writer-serializing mutex instead, with the reasoning written up in the
+   Phase 8c deviations entry and the 8c row above (a lock-free design
+   isn't actually safe against `memtable.SkipList.Iterator`'s documented
+   contract). Confirm this tradeoff (writer/writer parallelism traded for
+   provable correctness) is acceptable before flipping 8c's row to "Done"
+   too.
+3. **Commit.** `git status --short` at end of session showed these
+   changed/new files, all uncommitted: `CLAUDE.md`, `bench_test.go`,
+   `compaction/compact.go`, `compaction/merge_test.go`,
+   `compaction_crash_test.go`, `compaction_test.go`, `db.go`,
+   `killrestart_test.go`, `manifest/edit.go`, `manifest/manifest.go`,
+   `manifest_recovery_test.go`, `memtable/skiplist.go`,
+   `persistence_test.go`, `scan.go`, `scan_test.go`, plus new files
+   `compaction/leveled_test.go`, `concurrency_test.go`,
+   `l0l1_crash_subprocess_test.go`, `leveled_compaction_test.go`,
+   `manifest/leveled_edit_test.go`, `state_test_helpers_test.go`.
+4. **Known gaps intentionally left open** (already detailed above, not
+   re-litigated here): `Scan`'s returned iterator is only protected
+   against a racing file close for the duration of the `Scan` call itself
+   (an SSTable source in a long-lived iterator could still surface a read
+   error, never corruption, if a later compaction retires that file while
+   the caller keeps pulling from it); the pre-existing "`Put`/`Delete` can
+   return an error after durably succeeding" gap is untouched (separate,
+   deliberately out of scope for both 8c and 8d).
+5. Stretch tier is now fully implemented (8a/8b/8c/8d all done or
+   pending-review) — after the above, there's no required next phase;
+   any further work is open-ended hardening/polish, the reviewer's call.

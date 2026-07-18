@@ -24,10 +24,10 @@ func manifestHasAnyRemoved(edits []manifest.VersionEdit) bool {
 }
 
 // TestCompactionTriggerFiresAutomatically confirms MaybeCompact's
-// post-flush wiring actually engages once the live SSTable count exceeds
-// db.compactionThreshold, without any test calling MaybeCompact
+// post-flush wiring actually engages once the live L0 file count exceeds
+// db.l0CompactionThreshold, without any test calling MaybeCompact
 // directly -- purely from ordinary Put traffic through a small flush
-// threshold.
+// threshold. The merged output must land in L1, not stay in L0.
 func TestCompactionTriggerFiresAutomatically(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir)
@@ -44,8 +44,11 @@ func TestCompactionTriggerFiresAutomatically(t *testing.T) {
 		}
 	}
 
-	if len(db.sstables) > db.compactionThreshold {
-		t.Fatalf("live SSTable count = %d, want <= %d (compaction should have fired at least once)", len(db.sstables), db.compactionThreshold)
+	if len(db.l0()) > db.l0CompactionThreshold {
+		t.Fatalf("live L0 file count = %d, want <= %d (L0->L1 compaction should have fired at least once)", len(db.l0()), db.l0CompactionThreshold)
+	}
+	if len(db.l1()) == 0 {
+		t.Fatal("live L1 file count = 0, want >= 1 (L0->L1 compaction should have produced at least one L1 file)")
 	}
 
 	edits, err := manifest.ReplayManifest(db.manifestPath)

@@ -34,38 +34,75 @@ func cloneBytes(b []byte) []byte {
 // The merge itself reuses compaction.MergeIterator (Phase 6) rather than
 // reimplementing k-way merge/newest-wins resolution a second time: the
 // memtable and each SSTable become one Source apiece, ranked exactly like
-// DB.Get and MaybeCompact already rank them (memtable newest, then
-// db.sstables in their existing newest-first order). Each source is
+// DB.Get already ranks them -- memtable newest, then every live L0 file
+// (newest first), then every live L1 file whose range could overlap
+// [start, end) (Phase 8d: L1 files never overlap each other, so their
+// relative rank among themselves never matters, only that every one of
+// them ranks older than every L0 file and the memtable). Each source is
 // range-seeked to start first (memtable.SkipList.SeekIterator,
 // sstable.SSTable.SeekIterator) rather than iterated from its own
 // beginning and discarded up to start -- see those methods' doc comments
 // for the O(log n)/bounded-scan mechanics.
 //
-// Scan snapshots db.mem and db.sstables at the moment it's called. It
-// does not hold any lock beyond that: mutating the DB (Put, Delete, or a
-// flush/compaction a later Put/Delete triggers) while the returned
-// iterator is still in use is undefined behavior. This is the same "DB
-// is not safe for concurrent use" gap already documented in CLAUDE.md
-// §11 (maybeFlush reassigns db.mem/db.sstables/db.w with no
-// synchronization) -- Scan doesn't attempt to fix it, since that's
-// Phase 8c's own scope, not this one's.
+// Scan loads the current state (Phase 8c: via the lock-free atomic state
+// pointer, the same as Get) and snapshots it at the moment it's called --
+// mutating the DB (Put, Delete, or a flush/compaction a later Put/Delete
+// triggers) after Scan returns does not affect the already-returned
+// iterator, which keeps walking the SSTable/memtable objects live at
+// snapshot time.
+//
+// The one gap Phase 8c does NOT close: those objects are protected from
+// being closed/removed out from under a reader only for the duration of
+// this Scan call itself (see DB.inFlightReaders) -- once Scan returns,
+// the caller's continued Next() calls on the returned iterator are no
+// longer tracked. A sufficiently long-lived Scan iterator racing a
+// concurrent compaction that retires one of its source SSTables could
+// therefore see a read error from that source's Next() (the file was
+// closed), though never memory corruption or a crash -- sstable.Iterator
+// surfaces a closed file as a decode error via Err(), the same path as
+// any other read failure. Fully closing this gap would need per-iterator
+// lifecycle tracking (e.g. an explicit Close on the returned iterator,
+// with the file-retirement side accounting for iterators that are never
+// drained) -- a larger addition than this phase's stated scope, flagged
+// here for a future phase rather than solved speculatively.
 func (db *DB) Scan(start, end []byte) (memtable.Iterator, error) {
 	if bytes.Compare(start, end) > 0 {
 		return nil, ErrInvalidRange
 	}
 
-	sources := make([]compaction.Source, 0, 1+len(db.sstables))
-	sources = append(sources, compaction.Source{Iter: db.mem.SeekIterator(start), Rank: 0})
-	for i, st := range db.sstables {
+	db.beginRead()
+	defer db.endRead()
+	s := db.state.Load()
+
+	sources := make([]compaction.Source, 0, 1+len(s.l0)+len(s.l1))
+	sources = append(sources, compaction.Source{Iter: s.mem.SeekIterator(start), Rank: 0})
+	rank := 1
+	for _, st := range s.l0 {
 		it, err := st.SeekIterator(start)
 		if err != nil {
 			return nil, err
 		}
-		// Rank i+1: db.sstables is already newest-first (rank 0 is taken
-		// by the memtable), matching the exact convention MaybeCompact
-		// uses when it builds compaction.Source values from the same
-		// slice.
-		sources = append(sources, compaction.Source{Iter: it, Rank: i + 1})
+		sources = append(sources, compaction.Source{Iter: it, Rank: rank})
+		rank++
+	}
+	for _, st := range s.l1 {
+		m := st.Meta()
+		// [start, end) is half-open: a file can only contribute keys < end
+		// and > maxKey doesn't apply here since we need >= start too. A
+		// file entirely before start (m.MaxKey < start) or entirely at or
+		// past end (m.MinKey >= end, when end is non-empty) contributes
+		// nothing and is safely skipped -- a pure optimization, since any
+		// included-but-irrelevant file's entries are simply dropped by
+		// rangeIterator's own end check regardless.
+		if bytes.Compare(m.MaxKey, start) < 0 || bytes.Compare(m.MinKey, end) >= 0 {
+			continue
+		}
+		it, err := st.SeekIterator(start)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, compaction.Source{Iter: it, Rank: rank})
+		rank++
 	}
 
 	return &rangeIterator{src: compaction.NewMergeIterator(sources), end: end}, nil

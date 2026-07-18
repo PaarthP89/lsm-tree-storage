@@ -118,7 +118,7 @@ func TestTombstoneDroppingIteratorDropsSurvivingTombstone(t *testing.T) {
 	older := newFakeIterator(fakeEntry{"a", "stale", false})
 
 	m := NewMergeIterator([]Source{{Iter: newer, Rank: 0}, {Iter: older, Rank: 1}})
-	out := &tombstoneDroppingIterator{src: m}
+	out := &tombstoneDroppingIterator{src: m, canDrop: true}
 
 	var got []fakeEntry
 	for out.Next() {
@@ -127,6 +127,28 @@ func TestTombstoneDroppingIteratorDropsSurvivingTombstone(t *testing.T) {
 	want := []fakeEntry{{"b", "keep", false}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tombstone-dropping output = %+v, want %+v (key %q entirely absent)", got, want, "a")
+	}
+}
+
+// TestTombstoneDroppingIteratorPassesThroughWhenCannotDrop confirms
+// canDrop:false (Phase 8d's coverage-not-proven case) surfaces the
+// surviving tombstone unchanged instead of dropping it -- the required
+// safe behavior whenever a compaction can't prove every source holding a
+// possibly-older value for that key was included as an input.
+func TestTombstoneDroppingIteratorPassesThroughWhenCannotDrop(t *testing.T) {
+	newer := newFakeIterator(fakeEntry{"a", "", true}, fakeEntry{"b", "keep", false})
+	older := newFakeIterator(fakeEntry{"a", "stale", false})
+
+	m := NewMergeIterator([]Source{{Iter: newer, Rank: 0}, {Iter: older, Rank: 1}})
+	out := &tombstoneDroppingIterator{src: m, canDrop: false}
+
+	var got []fakeEntry
+	for out.Next() {
+		got = append(got, fakeEntry{key: string(out.Key()), value: string(out.Value()), tombstone: out.Tombstone()})
+	}
+	want := []fakeEntry{{"a", "", true}, {"b", "keep", false}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("passthrough output = %+v, want %+v (tombstone for %q must survive when coverage isn't proven)", got, want, "a")
 	}
 }
 

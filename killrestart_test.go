@@ -10,9 +10,11 @@ import (
 	"time"
 )
 
-// lsmloadBin is the path to the built cmd/lsmload helper binary, shared
-// across tests in this package. Built once in TestMain.
+// lsmloadBin is the path to the built cmd/lsmload helper binary, and
+// chaosworkerBin the path to the built cmd/chaosworker helper binary --
+// both shared across tests in this package. Built once in TestMain.
 var lsmloadBin string
+var chaosworkerBin string
 
 func TestMain(m *testing.M) {
 	tmpDir, err := os.MkdirTemp("", "lsmload-bin")
@@ -28,6 +30,15 @@ func TestMain(m *testing.M) {
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "TestMain: building lsmload helper:", err)
+		os.Exit(1)
+	}
+
+	chaosworkerBin = filepath.Join(tmpDir, "chaosworker")
+	buildWorker := exec.Command("go", "build", "-o", chaosworkerBin, "./cmd/chaosworker")
+	buildWorker.Stdout = os.Stderr
+	buildWorker.Stderr = os.Stderr
+	if err := buildWorker.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "TestMain: building chaosworker helper:", err)
 		os.Exit(1)
 	}
 

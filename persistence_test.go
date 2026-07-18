@@ -29,7 +29,7 @@ func TestFlushThenRead(t *testing.T) {
 		}
 	}
 
-	if len(db.sstables) == 0 {
+	if len(db.liveSSTables()) == 0 {
 		t.Fatal("no SSTable was flushed -- test didn't exercise the flush path it's meant to test")
 	}
 
@@ -55,7 +55,7 @@ func TestMemtableShadowsOlderSSTable(t *testing.T) {
 	if err := db.Put([]byte("key:000001"), []byte("original")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) == 0 {
+	if len(db.liveSSTables()) == 0 {
 		t.Fatal("key wasn't flushed to an SSTable -- test setup didn't force what it's meant to force")
 	}
 
@@ -84,7 +84,7 @@ func TestTombstoneSuppressesOlderSSTable(t *testing.T) {
 	if err := db.Put([]byte("key:000002"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) == 0 {
+	if len(db.liveSSTables()) == 0 {
 		t.Fatal("key wasn't flushed to an SSTable -- test setup didn't force what it's meant to force")
 	}
 
@@ -113,6 +113,13 @@ func TestRestartAfterFlushReadsAllSSTables(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	db.SetFlushThreshold(4 * 1024)
+	// This test is about SSTable discovery at Open time, not compaction --
+	// disable compaction entirely so the flushed-table count it asserts on
+	// isn't at the mercy of exactly where Phase 8d's independent L0/L1
+	// triggers happen to land for this dataset size (unlike the old
+	// single-level scheme, L0's threshold no longer counts L1's files at
+	// all, so the two are no longer comparable cycle-for-cycle).
+	db.SetL0CompactionThreshold(1 << 30)
 
 	const n = 3000
 	for i := 0; i < n; i++ {
@@ -120,7 +127,7 @@ func TestRestartAfterFlushReadsAllSSTables(t *testing.T) {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	flushedTables := len(db.sstables)
+	flushedTables := len(db.liveSSTables())
 	if flushedTables < 2 {
 		t.Fatalf("only %d SSTable(s) flushed, want >= 2 for this test to exercise multi-table discovery", flushedTables)
 	}
@@ -151,8 +158,8 @@ func TestRestartAfterFlushReadsAllSSTables(t *testing.T) {
 	}
 	defer db2.Close()
 
-	if len(db2.sstables) != flushedTables {
-		t.Fatalf("after restart, discovered %d SSTables, want %d", len(db2.sstables), flushedTables)
+	if len(db2.liveSSTables()) != flushedTables {
+		t.Fatalf("after restart, discovered %d SSTables, want %d", len(db2.liveSSTables()), flushedTables)
 	}
 
 	for i := 0; i < n; i++ {
@@ -181,8 +188,8 @@ func TestRestartPreservesNewestWinsAcrossFlushes(t *testing.T) {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
-	if len(db.sstables) < 3 {
-		t.Fatalf("got %d SSTables, want >= 3", len(db.sstables))
+	if len(db.liveSSTables()) < 3 {
+		t.Fatalf("got %d SSTables, want >= 3", len(db.liveSSTables()))
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -236,6 +243,9 @@ func TestRestartMemtableSizeBoundedByActivitySinceLastFlush(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	db.SetFlushThreshold(4 * 1024)
+	// Not a compaction test -- disable it for a deterministic flushed-table
+	// count (see TestRestartAfterFlushReadsAllSSTables for why).
+	db.SetL0CompactionThreshold(1 << 30)
 
 	const n = 3000
 	for i := 0; i < n; i++ {
@@ -243,9 +253,9 @@ func TestRestartMemtableSizeBoundedByActivitySinceLastFlush(t *testing.T) {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	countBeforeClose := countMemtableEntries(db.mem)
-	if len(db.sstables) < 2 {
-		t.Fatalf("only %d SSTable(s) flushed, want >= 2 for this test to exercise multi-flush WAL cleanup", len(db.sstables))
+	countBeforeClose := countMemtableEntries(db.mem())
+	if len(db.liveSSTables()) < 2 {
+		t.Fatalf("only %d SSTable(s) flushed, want >= 2 for this test to exercise multi-flush WAL cleanup", len(db.liveSSTables()))
 	}
 	if countBeforeClose >= n {
 		t.Fatalf("memtable holds %d entries out of %d total puts, want far fewer -- multiple flushes should have emptied it repeatedly", countBeforeClose, n)
@@ -260,7 +270,7 @@ func TestRestartMemtableSizeBoundedByActivitySinceLastFlush(t *testing.T) {
 	}
 	defer db2.Close()
 
-	countAfterRestart := countMemtableEntries(db2.mem)
+	countAfterRestart := countMemtableEntries(db2.mem())
 	if countAfterRestart != countBeforeClose {
 		t.Fatalf("memtable entry count after restart = %d, want %d (matching pre-close count) -- "+
 			"WAL replay is re-ingesting flushed history instead of just the tail since the last flush",

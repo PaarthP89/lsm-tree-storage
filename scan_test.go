@@ -116,8 +116,8 @@ func TestScanMemtableOnly(t *testing.T) {
 	if err := db.Put([]byte("e"), []byte("5")); err != nil {
 		t.Fatalf("Put(e): %v", err)
 	}
-	if len(db.sstables) != 0 {
-		t.Fatalf("setup produced %d SSTables, want 0 (memtable-only test)", len(db.sstables))
+	if len(db.liveSSTables()) != 0 {
+		t.Fatalf("setup produced %d SSTables, want 0 (memtable-only test)", len(db.liveSSTables()))
 	}
 
 	it, err := db.Scan([]byte("b"), []byte("e"))
@@ -155,11 +155,11 @@ func TestScanSSTableOnly(t *testing.T) {
 			t.Fatalf("Put(%s): %v", k, err)
 		}
 	}
-	if db.mem.SizeBytes() != 0 {
-		t.Fatalf("setup: memtable not empty (SizeBytes=%d), test wants an SSTable-only scan", db.mem.SizeBytes())
+	if db.mem().SizeBytes() != 0 {
+		t.Fatalf("setup: memtable not empty (SizeBytes=%d), test wants an SSTable-only scan", db.mem().SizeBytes())
 	}
-	if len(db.sstables) < 4 {
-		t.Fatalf("setup produced %d SSTables, want >= 4 (one per key)", len(db.sstables))
+	if len(db.liveSSTables()) < 4 {
+		t.Fatalf("setup produced %d SSTables, want >= 4 (one per key)", len(db.liveSSTables()))
 	}
 
 	it, err := db.Scan([]byte("m"), []byte("q"))
@@ -196,8 +196,8 @@ func TestScanAcrossMemtableAndSSTables(t *testing.T) {
 	if err := db.Put([]byte("d"), []byte("d-only")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) < 2 {
-		t.Fatalf("setup produced %d SSTables, want >= 2", len(db.sstables))
+	if len(db.liveSSTables()) < 2 {
+		t.Fatalf("setup produced %d SSTables, want >= 2", len(db.liveSSTables()))
 	}
 
 	db.SetFlushThreshold(1 << 30) // stop flushing: rest of the writes stay in the memtable
@@ -248,8 +248,8 @@ func TestScanExcludesTombstoneAcrossSources(t *testing.T) {
 	if err := db.Put([]byte("b"), []byte("2")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) < 2 {
-		t.Fatalf("setup produced %d SSTables, want >= 2", len(db.sstables))
+	if len(db.liveSSTables()) < 2 {
+		t.Fatalf("setup produced %d SSTables, want >= 2", len(db.liveSSTables()))
 	}
 
 	db.SetFlushThreshold(1 << 30)

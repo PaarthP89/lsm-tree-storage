@@ -162,3 +162,37 @@ func ReconstructSSTableSet(edits []VersionEdit) []string {
 	sort.Strings(result)
 	return result
 }
+
+// LiveSSTable is one entry in a level-aware reconstructed SSTable set: a
+// filename plus the level it currently belongs to (Phase 8d).
+type LiveSSTable struct {
+	File  string
+	Level int
+}
+
+// ReconstructLeveledSSTableSet replays edits exactly like
+// ReconstructSSTableSet (SSTableAdded inserts, SSTableRemoved deletes,
+// last edit per file wins), but additionally tracks which level each live
+// file belongs to, from that file's own SSTableAdded edit. A pre-8d edit
+// always decodes with Level 0 (see VersionEdit/DecodeEdit), so a file
+// added before Phase 8d existed is reconstructed as a plain L0 file --
+// correct, since a pre-8d MANIFEST never made any non-overlap promise
+// about its files that L1 could violate.
+func ReconstructLeveledSSTableSet(edits []VersionEdit) []LiveSSTable {
+	level := make(map[string]int)
+	for _, e := range edits {
+		switch e.Type {
+		case SSTableAdded:
+			level[e.File] = e.Level
+		case SSTableRemoved:
+			delete(level, e.File)
+		}
+	}
+
+	result := make([]LiveSSTable, 0, len(level))
+	for f, l := range level {
+		result = append(result, LiveSSTable{File: f, Level: l})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].File < result[j].File })
+	return result
+}

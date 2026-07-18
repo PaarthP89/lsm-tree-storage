@@ -22,6 +22,11 @@ func TestRecoveryIgnoresPlantedOrphanSSTable(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	db.SetFlushThreshold(4 * 1024)
+	// This test is about live-set discovery at Open time, not compaction --
+	// disable it so the flushed-table count isn't at the mercy of exactly
+	// where Phase 8d's independent L0/L1 triggers land for this dataset
+	// size (see TestRestartAfterFlushReadsAllSSTables for the same fix).
+	db.SetL0CompactionThreshold(1 << 30)
 
 	const n = 3000
 	for i := 0; i < n; i++ {
@@ -29,7 +34,7 @@ func TestRecoveryIgnoresPlantedOrphanSSTable(t *testing.T) {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	flushedTables := len(db.sstables)
+	flushedTables := len(db.liveSSTables())
 	if flushedTables < 2 {
 		t.Fatalf("only %d SSTable(s) flushed, want >= 2 for this test to be meaningful", flushedTables)
 	}
@@ -53,8 +58,8 @@ func TestRecoveryIgnoresPlantedOrphanSSTable(t *testing.T) {
 	}
 	defer db2.Close()
 
-	if len(db2.sstables) != flushedTables {
-		t.Fatalf("live SSTable count after restart = %d, want %d (bogus file must be excluded)", len(db2.sstables), flushedTables)
+	if len(db2.liveSSTables()) != flushedTables {
+		t.Fatalf("live SSTable count after restart = %d, want %d (bogus file must be excluded)", len(db2.liveSSTables()), flushedTables)
 	}
 
 	for i := 0; i < n; i++ {
@@ -83,6 +88,9 @@ func TestRecoveryVerifiesLiveSetMatchesManifestExactly(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	db.SetFlushThreshold(4 * 1024)
+	// Same reasoning as TestRecoveryIgnoresPlantedOrphanSSTable: not a
+	// compaction test, so disable it for a deterministic flushed-table count.
+	db.SetL0CompactionThreshold(1 << 30)
 
 	const n = 3000
 	for i := 0; i < n; i++ {
@@ -90,8 +98,8 @@ func TestRecoveryVerifiesLiveSetMatchesManifestExactly(t *testing.T) {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	if len(db.sstables) < 2 {
-		t.Fatalf("only %d SSTable(s) flushed, want >= 2", len(db.sstables))
+	if len(db.liveSSTables()) < 2 {
+		t.Fatalf("only %d SSTable(s) flushed, want >= 2", len(db.liveSSTables()))
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -113,11 +121,11 @@ func TestRecoveryVerifiesLiveSetMatchesManifestExactly(t *testing.T) {
 	}
 	defer db2.Close()
 
-	if len(db2.sstables) != len(wantLive) {
-		t.Fatalf("live SSTable count = %d, want %d (per MANIFEST replay)", len(db2.sstables), len(wantLive))
+	if len(db2.liveSSTables()) != len(wantLive) {
+		t.Fatalf("live SSTable count = %d, want %d (per MANIFEST replay)", len(db2.liveSSTables()), len(wantLive))
 	}
-	gotNames := make(map[string]struct{}, len(db2.sstables))
-	for _, st := range db2.sstables {
+	gotNames := make(map[string]struct{}, len(db2.liveSSTables()))
+	for _, st := range db2.liveSSTables() {
 		gotNames[filepath.Base(st.Meta().Path)] = struct{}{}
 	}
 	for _, name := range wantLive {
@@ -157,15 +165,15 @@ func TestRecoverySkipsSSTableOrphanedByCrashBetweenRenameAndManifestAppend(t *te
 			t.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	if len(db.sstables) != 0 {
-		t.Fatalf("got %d SSTables before injected flush, want 0", len(db.sstables))
+	if len(db.liveSSTables()) != 0 {
+		t.Fatalf("got %d SSTables before injected flush, want 0", len(db.liveSSTables()))
 	}
 
 	// Simulate the SSTable half of a flush completing (rename durable)
 	// without ever calling manifest.AppendEdit -- the crash point.
 	sstDir := filepath.Join(dir, sstableSubdir)
 	orphanPath := filepath.Join(sstDir, "000001.sst")
-	if _, err := sstable.FlushMemtable(db.mem, orphanPath); err != nil {
+	if _, err := sstable.FlushMemtable(db.mem(), orphanPath); err != nil {
 		t.Fatalf("FlushMemtable: %v", err)
 	}
 	if _, err := os.Stat(orphanPath); err != nil {
@@ -177,7 +185,7 @@ func TestRecoverySkipsSSTableOrphanedByCrashBetweenRenameAndManifestAppend(t *te
 	// writer swap). The WAL segment(s) covering all n puts are still
 	// fully intact on disk, exactly as they'd be after a real crash at
 	// this point.
-	if err := db.w.Close(); err != nil {
+	if err := db.w().Close(); err != nil {
 		t.Fatalf("close WAL writer: %v", err)
 	}
 
@@ -187,8 +195,8 @@ func TestRecoverySkipsSSTableOrphanedByCrashBetweenRenameAndManifestAppend(t *te
 	}
 	defer db2.Close()
 
-	if len(db2.sstables) != 0 {
-		t.Fatalf("live SSTable count after restart = %d, want 0 -- orphaned SSTable must be excluded", len(db2.sstables))
+	if len(db2.liveSSTables()) != 0 {
+		t.Fatalf("live SSTable count after restart = %d, want 0 -- orphaned SSTable must be excluded", len(db2.liveSSTables()))
 	}
 	if _, err := os.Stat(orphanPath); err != nil {
 		t.Fatalf("orphan SSTable missing after restart (stat err = %v), want left on disk untouched (not deleted, just ignored)", err)
@@ -223,14 +231,14 @@ func TestNextSeqAvoidsCollisionWithOrphanedSSTable(t *testing.T) {
 
 	sstDir := filepath.Join(dir, sstableSubdir)
 	orphanPath := filepath.Join(sstDir, "000001.sst")
-	if _, err := sstable.FlushMemtable(db.mem, orphanPath); err != nil {
+	if _, err := sstable.FlushMemtable(db.mem(), orphanPath); err != nil {
 		t.Fatalf("FlushMemtable: %v", err)
 	}
 	orphanDataBefore, err := os.ReadFile(orphanPath)
 	if err != nil {
 		t.Fatalf("ReadFile(orphan): %v", err)
 	}
-	if err := db.w.Close(); err != nil {
+	if err := db.w().Close(); err != nil {
 		t.Fatalf("close WAL writer: %v", err)
 	}
 
@@ -244,10 +252,10 @@ func TestNextSeqAvoidsCollisionWithOrphanedSSTable(t *testing.T) {
 	if err := db2.Put([]byte("b"), []byte("2")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db2.sstables) != 1 {
-		t.Fatalf("got %d SSTables after real flush, want 1", len(db2.sstables))
+	if len(db2.liveSSTables()) != 1 {
+		t.Fatalf("got %d SSTables after real flush, want 1", len(db2.liveSSTables()))
 	}
-	newPath := db2.sstables[0].Meta().Path
+	newPath := db2.liveSSTables()[0].Meta().Path
 	if newPath == orphanPath {
 		t.Fatalf("new flush reused the orphan's path %s -- sequence collision", orphanPath)
 	}
@@ -287,10 +295,10 @@ func TestOpenFailsLoudlyWhenManifestListsMissingSSTable(t *testing.T) {
 	if err := db.Put([]byte("key:000001"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) != 1 {
-		t.Fatalf("got %d SSTables, want 1", len(db.sstables))
+	if len(db.liveSSTables()) != 1 {
+		t.Fatalf("got %d SSTables, want 1", len(db.liveSSTables()))
 	}
-	flushedPath := db.sstables[0].Meta().Path
+	flushedPath := db.liveSSTables()[0].Meta().Path
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -327,8 +335,8 @@ func TestOpenRepairsTornManifestTailBeforeAcceptingNewFlushes(t *testing.T) {
 	if err := db.Put([]byte("key:000001"), []byte("gen1")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) != 1 {
-		t.Fatalf("got %d SSTables, want 1", len(db.sstables))
+	if len(db.liveSSTables()) != 1 {
+		t.Fatalf("got %d SSTables, want 1", len(db.liveSSTables()))
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -359,8 +367,8 @@ func TestOpenRepairsTornManifestTailBeforeAcceptingNewFlushes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open (after simulated torn manifest tail): %v", err)
 	}
-	if len(db2.sstables) != 1 {
-		t.Fatalf("got %d SSTables after repair, want 1 (the pre-crash flush)", len(db2.sstables))
+	if len(db2.liveSSTables()) != 1 {
+		t.Fatalf("got %d SSTables after repair, want 1 (the pre-crash flush)", len(db2.liveSSTables()))
 	}
 
 	// A real flush after the repaired Open must be durably, correctly
@@ -370,8 +378,8 @@ func TestOpenRepairsTornManifestTailBeforeAcceptingNewFlushes(t *testing.T) {
 	if err := db2.Put([]byte("key:000002"), []byte("gen2")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db2.sstables) != 2 {
-		t.Fatalf("got %d SSTables after post-repair flush, want 2", len(db2.sstables))
+	if len(db2.liveSSTables()) != 2 {
+		t.Fatalf("got %d SSTables after post-repair flush, want 2", len(db2.liveSSTables()))
 	}
 	if err := db2.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -383,8 +391,8 @@ func TestOpenRepairsTornManifestTailBeforeAcceptingNewFlushes(t *testing.T) {
 	}
 	defer db3.Close()
 
-	if len(db3.sstables) != 2 {
-		t.Fatalf("got %d SSTables on final restart, want 2 -- the post-repair flush must survive its own restart", len(db3.sstables))
+	if len(db3.liveSSTables()) != 2 {
+		t.Fatalf("got %d SSTables on final restart, want 2 -- the post-repair flush must survive its own restart", len(db3.liveSSTables()))
 	}
 
 	v, found, err := db3.Get([]byte("key:000001"))
@@ -433,8 +441,8 @@ func TestFlushAppendsManifestEditSynchronously(t *testing.T) {
 	if err := db.Put([]byte("key:000001"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if len(db.sstables) != 1 {
-		t.Fatalf("got %d SSTables after Put, want 1", len(db.sstables))
+	if len(db.liveSSTables()) != 1 {
+		t.Fatalf("got %d SSTables after Put, want 1", len(db.liveSSTables()))
 	}
 
 	edits, err := manifest.ReplayManifest(db.manifestPath)
@@ -445,7 +453,7 @@ func TestFlushAppendsManifestEditSynchronously(t *testing.T) {
 	if len(live) != 1 {
 		t.Fatalf("MANIFEST live set = %v, want exactly 1 entry", live)
 	}
-	wantName := filepath.Base(db.sstables[0].Meta().Path)
+	wantName := filepath.Base(db.liveSSTables()[0].Meta().Path)
 	if live[0] != wantName {
 		t.Fatalf("MANIFEST live set = %v, want [%s]", live, wantName)
 	}

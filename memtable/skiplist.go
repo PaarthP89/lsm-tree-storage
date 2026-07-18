@@ -180,22 +180,23 @@ func (s *SkipList) SizeBytes() int {
 }
 
 // Iterator returns a sorted iterator over the skip list's entries as of
-// the call. Traversal after this call is not synchronized with
-// concurrent writes to the same list -- callers that need a stable view
-// (e.g. Phase 3's flush) must ensure the list isn't mutated while the
-// iterator is in use.
+// the call. Each subsequent Next() call (Phase 8c) takes its own brief
+// RLock to advance and copy out the entry it lands on, so the returned
+// iterator is safe to keep pulling from concurrently with Put/Delete on
+// this same list -- see skipListIterator.Next's doc comment for why this
+// is a genuine safety fix, not just a convenience.
 func (s *SkipList) Iterator() Iterator {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return &skipListIterator{next: s.head.forward[0]}
+	return &skipListIterator{s: s, next: s.head.forward[0]}
 }
 
 // SeekIterator returns a sorted iterator over entries with key >= start
 // (Phase 8b range queries), found via the same O(log n) multi-level
 // descent Get and insert already use to land on the predecessor of a
 // target key -- not a full scan from the head that walks past and
-// discards every entry before start. The same "not synchronized with
-// concurrent writes" caveat as Iterator applies.
+// discards every entry before start. Safe for concurrent use with
+// Put/Delete for the same reason Iterator is -- see skipListIterator.Next.
 func (s *SkipList) SeekIterator(start []byte) Iterator {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -206,24 +207,53 @@ func (s *SkipList) SeekIterator(start []byte) Iterator {
 			x = x.forward[i]
 		}
 	}
-	return &skipListIterator{next: x.forward[0]}
+	return &skipListIterator{s: s, next: x.forward[0]}
 }
 
+// skipListIterator walks forward pointers starting at next. Phase 8c
+// (concurrent readers/writers): this list may be actively receiving
+// Put/Delete calls from another goroutine for as long as this iterator
+// is in use (e.g. a Scan iterator the caller keeps pulling from well
+// after the Scan call itself returns), so simply following it.next.
+// forward[0] without synchronization -- the original, single-threaded-era
+// design -- is a real, race-detector-confirmed data race against a
+// concurrent insert() relinking that same node's forward slice.
+//
+// The fix: every Next() call takes s's own RLock for the brief moment it
+// reads one node's forward pointer and copies out its key/value/
+// tombstone into the iterator's own fields, then releases it. This is
+// safe even though a node's value/tombstone CAN be overwritten in place
+// by a later Put on the same key (see insert()'s early-return branch):
+// that overwrite always replaces the slice header with a reference to a
+// brand-new cloned array (cloneBytes), it never mutates bytes within an
+// existing array, so a slice header copied out under RLock keeps
+// pointing at a backing array that's immutable from that point on --
+// safe to read from after the lock is released, no matter what the node
+// itself is mutated to afterward.
 type skipListIterator struct {
+	s    *SkipList
 	next *node
-	cur  *node
+
+	curKey       []byte
+	curValue     []byte
+	curTombstone bool
 }
 
 func (it *skipListIterator) Next() bool {
+	it.s.mu.RLock()
+	defer it.s.mu.RUnlock()
+
 	if it.next == nil {
-		it.cur = nil
 		return false
 	}
-	it.cur = it.next
+	cur := it.next
 	it.next = it.next.forward[0]
+	it.curKey = cur.key
+	it.curValue = cur.value
+	it.curTombstone = cur.tombstone
 	return true
 }
 
-func (it *skipListIterator) Key() []byte     { return it.cur.key }
-func (it *skipListIterator) Value() []byte   { return it.cur.value }
-func (it *skipListIterator) Tombstone() bool { return it.cur.tombstone }
+func (it *skipListIterator) Key() []byte     { return it.curKey }
+func (it *skipListIterator) Value() []byte   { return it.curValue }
+func (it *skipListIterator) Tombstone() bool { return it.curTombstone }
