@@ -188,6 +188,24 @@ func TestSizeBytesGrowsAndTracksOverwrite(t *testing.T) {
 	}
 }
 
+// TestGetReturnsIndependentCopy guards against an aliasing bug: Get must
+// not return the node's own backing array, since SkipList is the memtable
+// behind an embedded library's DB.Get -- callers hold the returned slice
+// past the call, and a caller mutating it in place must never be able to
+// corrupt what a later Get of the same key returns.
+func TestGetReturnsIndependentCopy(t *testing.T) {
+	s := New()
+	s.Put([]byte("a"), []byte("original"))
+
+	v, _, _ := s.Get([]byte("a"))
+	v[0] = 'X'
+
+	v2, _, _ := s.Get([]byte("a"))
+	if !bytes.Equal(v2, []byte("original")) {
+		t.Fatalf("Get(a) after mutating a previous Get's result = %q, want %q -- Get must return an independent copy", v2, "original")
+	}
+}
+
 func TestManyKeysSortedAndRetrievable(t *testing.T) {
 	s := New()
 	n := 2000

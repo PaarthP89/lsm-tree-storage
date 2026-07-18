@@ -165,7 +165,12 @@ func (s *SkipList) Get(key []byte) (value []byte, found bool, tombstone bool) {
 	if x.tombstone {
 		return nil, true, true
 	}
-	return x.value, true, false
+	// Cloned, not returned directly: DB is an embedded library whose
+	// callers hold this slice past the call. Returning x.value's backing
+	// array directly would let a caller's in-place mutation silently
+	// corrupt this node for every future Get of the same key, since a
+	// later Put on a different key never touches it.
+	return cloneBytes(x.value), true, false
 }
 
 func (s *SkipList) SizeBytes() int {
