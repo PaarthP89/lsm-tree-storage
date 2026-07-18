@@ -291,3 +291,51 @@ func TestConcurrentPutGetDelete(t *testing.T) {
 		}
 	}
 }
+
+// TestSeekIteratorLandsOnFirstKeyGEStart confirms SeekIterator finds the
+// exact same starting point a full scan-and-discard would, across a
+// start that matches an existing key exactly, a start that falls between
+// two keys, a start before every key, and a start after every key.
+func TestSeekIteratorLandsOnFirstKeyGEStart(t *testing.T) {
+	s := New()
+	for _, k := range []string{"b", "d", "f", "h"} {
+		s.Put([]byte(k), []byte(k+"-val"))
+	}
+
+	cases := []struct {
+		start string
+		want  []string // remaining keys in order, from the seek point onward
+	}{
+		{"a", []string{"b", "d", "f", "h"}}, // before every key
+		{"b", []string{"b", "d", "f", "h"}}, // exact match on the first key
+		{"c", []string{"d", "f", "h"}},      // between two keys
+		{"h", []string{"h"}},                // exact match on the last key
+		{"i", nil},                          // after every key
+	}
+
+	for _, c := range cases {
+		it := s.SeekIterator([]byte(c.start))
+		var got []string
+		for it.Next() {
+			got = append(got, string(it.Key()))
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("SeekIterator(%q) = %v, want %v", c.start, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("SeekIterator(%q) = %v, want %v", c.start, got, c.want)
+			}
+		}
+	}
+}
+
+// TestSeekIteratorOnEmptyList confirms seeking an empty skip list returns
+// an already-exhausted iterator, not a panic.
+func TestSeekIteratorOnEmptyList(t *testing.T) {
+	s := New()
+	it := s.SeekIterator([]byte("anything"))
+	if it.Next() {
+		t.Fatalf("SeekIterator on empty list yielded a result, want none")
+	}
+}

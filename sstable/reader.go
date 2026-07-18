@@ -25,6 +25,7 @@ type SSTable struct {
 	entryCount   int
 	index        []indexEntry
 	footerOffset int64
+	bloom        *bloomFilter // nil for a pre-8a file or an empty table
 }
 
 // OpenSSTable opens the file at path and parses its footer. It returns an
@@ -71,7 +72,7 @@ func OpenSSTable(path string) (*SSTable, error) {
 		return nil, fmt.Errorf("sstable: %s: footer checksum mismatch (corrupt file)", path)
 	}
 
-	index, minKey, maxKey, count, err := decodeFooter(footerBody)
+	index, minKey, maxKey, count, bloom, err := decodeFooter(footerBody)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("sstable: %s: %w", path, err)
@@ -85,6 +86,7 @@ func OpenSSTable(path string) (*SSTable, error) {
 		entryCount:   count,
 		index:        index,
 		footerOffset: footerOffset,
+		bloom:        bloom,
 	}, nil
 }
 
@@ -97,6 +99,14 @@ func (s *SSTable) Close() error {
 // returned when it was written.
 func (s *SSTable) Meta() SSTableMeta {
 	return SSTableMeta{Path: s.path, MinKey: s.minKey, MaxKey: s.maxKey, EntryCount: s.entryCount}
+}
+
+// HasBloomFilter reports whether this table has a bloom filter (built by
+// Phase 8a). false for a pre-8a file or an empty table -- both fall
+// through to a full lookup on every Get. Exposed for tests/diagnostics,
+// not part of the read path itself.
+func (s *SSTable) HasBloomFilter() bool {
+	return s.bloom != nil
 }
 
 // Get looks up key. found reports whether key's newest entry in this
@@ -114,6 +124,12 @@ func (s *SSTable) Get(key []byte) (value []byte, found bool, tombstone bool, err
 		return nil, false, false, nil
 	}
 	if bytes.Compare(key, s.minKey) < 0 || bytes.Compare(key, s.maxKey) > 0 {
+		return nil, false, false, nil
+	}
+	if s.bloom != nil && !s.bloom.MayContain(key) {
+		// Definitely absent: skip the sparse-index binary search and the
+		// on-disk scan entirely. A nil filter (pre-8a file, or an empty
+		// table -- which never reaches here anyway) always falls through.
 		return nil, false, false, nil
 	}
 
@@ -169,6 +185,72 @@ func (s *SSTable) Get(key []byte) (value []byte, found bool, tombstone bool, err
 func (s *SSTable) Iterator() *Iterator {
 	sr := io.NewSectionReader(s.file, 0, s.footerOffset)
 	return &Iterator{path: s.path, br: bufio.NewReader(sr)}
+}
+
+// emptyIterator returns an Iterator that reports done on the very first
+// Next() call -- the correct shape for "this table has nothing in the
+// requested range" without a caller needing a separate nil-vs-empty case.
+func emptyIterator(path string) *Iterator {
+	return &Iterator{path: path, br: bufio.NewReader(bytes.NewReader(nil))}
+}
+
+// SeekIterator returns a sorted iterator (tombstones included, same as
+// Iterator) over every entry with key >= start (Phase 8b range queries).
+// It locates the starting position with the same sparse-index binary
+// search Get uses -- never a full-file scan -- then linear-scans forward
+// within that one block (at most indexInterval entries, the same bound
+// Get relies on) to find the exact byte offset of the first qualifying
+// entry before handing back an Iterator positioned there.
+//
+// Unlike Get, this doesn't take an upper bound: the returned Iterator
+// will walk every remaining entry through the end of the table if asked
+// to. Deciding how far to actually read is the caller's job (DB.Scan
+// stops pulling once it reaches its own end key) -- since Next() only
+// does work when called, an unconsulted tail of the table costs nothing.
+func (s *SSTable) SeekIterator(start []byte) (*Iterator, error) {
+	if len(s.index) == 0 {
+		return emptyIterator(s.path), nil
+	}
+
+	// Same binary search as Get: find the first index entry whose key
+	// exceeds start: the block that could contain the target begins at
+	// the entry just before it. i==0 (start <= every index key, i.e.
+	// start <= minKey) resolves to i=1, landing on index[0].offset == 0
+	// -- the very first block -- which is exactly right for a seek from
+	// before the table's start.
+	i := sort.Search(len(s.index), func(i int) bool {
+		return bytes.Compare(s.index[i].key, start) > 0
+	})
+	if i == 0 {
+		i = 1
+	}
+	blockStart := s.index[i-1].offset
+
+	sr := io.NewSectionReader(s.file, blockStart, s.footerOffset-blockStart)
+	br := bufio.NewReader(sr)
+	offset := blockStart
+
+	for {
+		e, err := wal.DecodeEntry(br)
+		if err == io.EOF {
+			return emptyIterator(s.path), nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("sstable: %s: %w", s.path, err)
+		}
+		if bytes.Compare(e.Key, start) >= 0 {
+			// Hand back a fresh Iterator over a SectionReader starting
+			// exactly at this entry's byte offset, with Next() not yet
+			// called on it -- the same "unadvanced" contract every other
+			// SortedIterator source (compaction.MergeIterator's sources)
+			// requires. The entry just decoded above is deliberately
+			// discarded and re-read by the caller's first Next() rather
+			// than threaded through some out-of-band "primed" state.
+			rest := io.NewSectionReader(s.file, offset, s.footerOffset-offset)
+			return &Iterator{path: s.path, br: bufio.NewReader(rest)}, nil
+		}
+		offset += int64(len(wal.EncodeEntry(e)))
+	}
 }
 
 // Iterator walks an SSTable's data section in key order. Unlike Get, a

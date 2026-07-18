@@ -266,8 +266,8 @@ what a future session needs and can't just re-derive from the code.
 | 5 — Chaos Test | Done | `cmd/chaosworker` + `cmd/chaos`: real-subprocess SIGKILL harness, ACK-line-on-stdout is the sole ground truth for "durably acknowledged." Verifies the full key range past the ACK boundary, not just up to it. 20/20 real runs clean, 0 lost/corrupt — see `docs/chaos-report.md` (includes the check confirming Go's Darwin `fsync` issues `F_FULLFSYNC`, so it's real durability, not a platform gap). `SkipList.Get` returns a copy of the value, not an alias into internal storage. |
 | 6 — Compaction | Done | New `compaction` package: `MergeIterator` (heap-based k-way merge, newest source wins ties) + a tombstone-dropping wrapper (safe only because compaction is single-level — see §8). `DB.MaybeCompact` triggers synchronously once live SSTable count exceeds 4; MANIFEST edits appended ADDED-before-REMOVED; old inputs closed/deleted on success. The new compacted output is opened and verified *before* the MANIFEST edits retiring its inputs are committed — verifying after would risk real, permanent data loss if the just-written file were corrupt (its inputs' WAL backing is long gone by compaction time, unlike a flush). |
 | 7 — Benchmarks + wrap-up | Done | `bench_test.go`: `BenchmarkWrite` (369 ops/sec, fsync-bound by design), `BenchmarkReadHot` (458k ops/sec, pure memtable), `BenchmarkReadCold` (58.7k ops/sec, 13 uncompacted SSTables), `BenchmarkReadAfterCompaction` (76.6k ops/sec, 1 SSTable) — real numbers from `go test -bench=. -benchtime=2000x`, see README. Extended `cmd/chaos` run (25 iterations, `-compactionthreshold=3`, 40,460 acked writes, 0 lost/corrupt) puts compaction's crash windows inside a real randomized `SIGKILL`, not just Phase 6's four hand-injected unit tests — confirmed by inspecting a kept iteration's MANIFEST (98 ADDED/96 REMOVED edits from one burst). Also re-verified, by reading the actual Go 1.26.5 toolchain source (`internal/poll/fd_fsync_darwin.go`), that the Phase 5 F_FULLFSYNC claim still holds on this toolchain. No correctness bugs found by this phase's benchmarking or extended chaos work. |
-| 8a — Bloom filters | Not started (stretch) | |
-| 8b — Range queries | Not started (stretch) | |
+| 8a — Bloom filters | Implemented — pending human review | New self-describing footer section (`sstable`), FNV-1a/Kirsch-Mitzenmacher filter built via a buffered-keys pass in `FlushIterator` (flush and compaction both, no special-casing), consulted in `Get` to skip the sparse-index/scan path on a "definitely absent" result. ~20x fewer ns/op on a 100%-miss workload (263 vs 5236 ns/op, Apple M2). Backward-compat with pre-8a files verified against a hand-built pre-8a-format file. Zero false negatives (50k keys), 1.04% observed FPR vs 1% target. See the Deviations/additions entry below for the full footer layout and design rationale. |
+| 8b — Range queries | Implemented — pending human review | `DB.Scan(start, end)` half-open `[start, end)`, newest-wins, tombstone-filtered, built on `compaction.MergeIterator` (unmodified) + new O(log n) seek support in `memtable.SkipList` and bounded-scan seek support in `sstable.SSTable`. Concurrent-mutation-during-Scan left explicitly undefined, deferred to 8c. See the Deviations/additions entry below for the full design. |
 | 8c — Concurrent readers/writers | Not started (stretch) | |
 | 8d — Multi-level compaction | Not started (stretch) | |
 
@@ -319,6 +319,98 @@ nothing in §3–§7 has changed):
   (`-compactionthreshold` flag on both).
 - `cmd/lsmload`, `cmd/chaosworker`, `cmd/chaos`, `internal/chaosdata`:
   test/harness-only binaries, not part of the library's public interface.
+- `sstable`: Phase 8a bloom filters. New footer section, appended after
+  the existing `entry_count` field (all bytes before it are byte-for-byte
+  unchanged from Phase 3/4):
+  `[has_bloom: 1B]`, and if 1: `[k: 4B][bits_len: 4B][bits: bits_len bytes]`.
+  Backward compatibility works by exhaustion, not a version marker: a
+  pre-8a footer body ends right after `entry_count` with zero bytes left
+  in the reader, and `decodeFooter` treats "nothing left to read" and
+  "has_bloom explicitly 0" identically (no filter, `Get` always falls
+  through to the full sparse-index lookup). Sizing (`newBloomFilter`):
+  standard `m = ceil(-n·ln(fpr)/ln(2)²)` bits, `k = round((m/n)·ln2)` hash
+  functions, target fpr = 1%. Hashing: FNV-1a 64-bit, hand-inlined rather
+  than routed through `hash/fnv`'s `hash.Hash64` interface — that
+  allocates a hasher per call, and an early version of the miss-heavy
+  benchmark below showed that allocation alone made the filter path
+  slower than the scan it exists to skip. Probe positions:
+  `(h1 + i·h2) mod (len(bits)·8)` for `i` in `[0, k)` (Kirsch-Mitzenmacher
+  double hashing), where h1/h2 are the two 32-bit halves of the FNV-1a
+  sum. Entry-count-before-sizing problem: resolved with a buffered-keys
+  pass, not a pre-count pass or a fully-buffered-entries pass — during
+  `FlushIterator`'s existing single streaming pass, every key (not value)
+  is cloned into a slice as it's written, then the filter is built from
+  that slice once the final count is known. Chosen over a pre-count pass
+  because `entryIterator` sources (a live memtable iterator, compaction's
+  merge iterator over open file handles) aren't cheaply replayable for a
+  separate counting pass; chosen over buffering full entries because
+  values dominate memory cost and aren't needed for filter construction.
+  `n = 0` (empty table): `newBloomFilter` returns nil, no filter is
+  written, identical on-disk shape to a pre-8a empty table. Both flush
+  and compaction output get a filter automatically and identically, since
+  both go through the same `FlushIterator` — no special-casing needed.
+  `SSTable.HasBloomFilter() bool`: new public introspection method
+  (test/diagnostic use only, not part of the read path). Real numbers
+  (Apple M2, `go test ./sstable/... -bench=BenchmarkGetMiss -benchtime=5000x -benchmem`,
+  keys placed so misses genuinely fall inside `[minKey, maxKey]` and reach
+  the scan path rather than being rejected by the pre-existing range
+  check): `BenchmarkGetMissWithBloomFilter` 263 ns/op, 5 allocs/op vs
+  `BenchmarkGetMissWithoutBloomFilter` 5236 ns/op, 241 allocs/op — ~20x
+  fewer ns/op on a 100%-miss workload against a 20,000-entry table.
+  Observed false-positive rate in `TestBloomFilterFalsePositiveRate`:
+  1.04% against a 1% target (100,000 trials). Zero false negatives
+  verified across 50,000 keys in `TestBloomFilterZeroFalseNegatives`.
+  Backward compatibility verified in
+  `TestOpenPreBloomSSTableIsBackwardCompatible` by hand-constructing a
+  real pre-8a-format file byte-for-byte and confirming it opens and reads
+  correctly with no filter. Compaction-output propagation verified in
+  `compaction.TestCompactOutputHasBloomFilter`.
+- `DB.Scan(start, end []byte) (memtable.Iterator, error)` (Phase 8b): new
+  public method beyond §6's listed `DB` signatures. Half-open `[start,
+  end)` range convention: `start` included, `end` excluded; `start ==
+  end` is a valid call that returns an iterator done on the first
+  `Next()`, `start > end` returns the new exported `ErrInvalidRange`
+  without constructing anything. Sorted, deduplicated, tombstone-filtered
+  across the memtable and every live SSTable, newest-wins on overlap —
+  built by reusing `compaction.MergeIterator` unmodified (one
+  `compaction.Source` per source, ranked exactly like `MaybeCompact`
+  already ranks them: memtable rank 0, then `db.sstables` in its existing
+  newest-first order), rather than reimplementing k-way merge/newest-wins
+  resolution a second time. The returned type is `memtable.Iterator` —
+  the interface already defined in §6, not a new shape — implemented by
+  a new unexported `rangeIterator` (in the new file `scan.go`) that wraps
+  `MergeIterator` to enforce the `end` bound (which `MergeIterator` has
+  no concept of) and to drop tombstones (a tombstoned key must never be
+  yielded at all, since `Iterator`'s 3-method shape has no found/
+  tombstone pair the way `Get` does). `rangeIterator.Key()`/`Value()`
+  return clones, not aliases into a source's internal buffer, matching
+  the existing defensive-copy convention (`SkipList.Get`).
+- `memtable.SkipList.SeekIterator(start []byte) Iterator`: new method,
+  lands on the first key >= start via the same O(log n) multi-level
+  descent `Get`/`insert` already use, instead of iterating from the head
+  and discarding entries before `start`.
+- `sstable.SSTable.SeekIterator(start []byte) (*Iterator, error)`: new
+  method, binary-searches the existing sparse index for the block that
+  could contain the first key >= start (identical search to `Get`'s),
+  then linear-scans forward within that one block (bounded by
+  `indexInterval`, never a full-file scan) to find the exact byte offset
+  to start the returned `Iterator` from. Does not take an upper bound —
+  deciding how far to actually read is the caller's job (`DB.Scan`'s
+  `rangeIterator` stops pulling once it reaches `end`), since an
+  unconsulted tail of the table costs nothing until `Next()` is actually
+  called on it.
+- `sstable.SSTable.HasBloomFilter`-style addition:
+  `SSTable`/`SkipList`'s new `SeekIterator` methods reuse
+  `compaction.SortedIterator`'s exact method shape (`Next`/`Key`/`Value`/
+  `Tombstone`) structurally, so no new interface or adapter type was
+  needed to feed them into `compaction.Source`/`NewMergeIterator`.
+- **Known limitation, deliberately not fixed this phase**: a `Scan`
+  iterator's behavior is undefined if the `DB` is mutated (`Put`,
+  `Delete`, or a flush/compaction a later `Put`/`Delete` triggers) while
+  that iterator is still in use — `Scan` snapshots `db.mem`/
+  `db.sstables` at call time but holds no lock beyond that. This is the
+  same "`DB` is not safe for concurrent use" gap already on record above;
+  fixing it is Phase 8c's exclusive scope, not this one's.
 
 ## 12. Testing conventions
 

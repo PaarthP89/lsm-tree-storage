@@ -190,6 +190,25 @@ func (s *SkipList) Iterator() Iterator {
 	return &skipListIterator{next: s.head.forward[0]}
 }
 
+// SeekIterator returns a sorted iterator over entries with key >= start
+// (Phase 8b range queries), found via the same O(log n) multi-level
+// descent Get and insert already use to land on the predecessor of a
+// target key -- not a full scan from the head that walks past and
+// discards every entry before start. The same "not synchronized with
+// concurrent writes" caveat as Iterator applies.
+func (s *SkipList) SeekIterator(start []byte) Iterator {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	x := s.head
+	for i := s.level - 1; i >= 0; i-- {
+		for x.forward[i] != nil && bytes.Compare(x.forward[i].key, start) < 0 {
+			x = x.forward[i]
+		}
+	}
+	return &skipListIterator{next: x.forward[0]}
+}
+
 type skipListIterator struct {
 	next *node
 	cur  *node

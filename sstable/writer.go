@@ -101,18 +101,29 @@ func FlushIterator(it entryIterator, path string) (*SSTableMeta, error) {
 		minKey []byte
 		maxKey []byte
 		count  int
+		keys   [][]byte
 	)
 
 	for it.Next() {
 		key := it.Key()
+		keyCopy := cloneBytes(key)
 
 		if count == 0 {
-			minKey = cloneBytes(key)
+			minKey = keyCopy
 		}
-		maxKey = cloneBytes(key)
+		maxKey = keyCopy
+		// Buffered-keys pass for bloom sizing: the filter needs the final
+		// entry count before it can be sized (see newBloomFilter), but
+		// entryIterator is a single forward-only pass (a live memtable
+		// iterator, or compaction's merge iterator reading from open file
+		// handles) that can't cheaply be replayed for a separate counting
+		// pass. Buffering just the keys -- not the values -- costs far
+		// less memory than buffering full entries, while still needing
+		// only one pass over the source.
+		keys = append(keys, keyCopy)
 
 		if count%indexInterval == 0 {
-			index = append(index, indexEntry{key: cloneBytes(key), offset: offset})
+			index = append(index, indexEntry{key: keyCopy, offset: offset})
 		}
 
 		buf := wal.EncodeEntry(wal.Entry{
@@ -129,8 +140,16 @@ func FlushIterator(it entryIterator, path string) (*SSTableMeta, error) {
 		count++
 	}
 
+	// nil when count == 0 (newBloomFilter's explicit empty-table case):
+	// Get on that table already short-circuits on len(index) == 0 before
+	// ever consulting a filter, so no filter is needed either way.
+	bloom := newBloomFilter(count, defaultBloomFPR)
+	for _, k := range keys {
+		bloom.Add(k)
+	}
+
 	footerOffset := offset
-	footerBody := encodeFooter(index, minKey, maxKey, count)
+	footerBody := encodeFooter(index, minKey, maxKey, count, bloom)
 	if _, err := bw.Write(footerBody); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("sstable: write footer %s: %w", tmpPath, err)
