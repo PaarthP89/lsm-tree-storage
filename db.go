@@ -154,6 +154,29 @@ func (db *DB) drainReaders() {
 	}
 }
 
+// Stats is a point-in-time snapshot of DB's internal shape -- test/
+// diagnostic use only (mirrors sstable.SSTable.HasBloomFilter's role),
+// not part of the read/write path. Lock-free, like Get: loads the current
+// state once and reads off it.
+type Stats struct {
+	L0Count           int
+	L1Count           int
+	MemtableSizeBytes int
+}
+
+// Stats returns a snapshot of the current dbState: live L0/L1 file counts
+// and the current memtable's size in bytes. Useful for observing a
+// flush/compaction's effect on level membership without reaching into
+// unexported fields.
+func (db *DB) Stats() Stats {
+	s := db.state.Load()
+	return Stats{
+		L0Count:           len(s.l0),
+		L1Count:           len(s.l1),
+		MemtableSizeBytes: s.mem.SizeBytes(),
+	}
+}
+
 // liveSSTables returns every currently-live SSTable across both levels,
 // L0 (newest-first) then L1 (key-range order), as of the current state.
 // A flat view for diagnostics/tests that only care about total live count

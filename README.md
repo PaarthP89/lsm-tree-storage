@@ -13,6 +13,12 @@ err = db.Delete([]byte("user:1"))
 err = db.Close()
 ```
 
+Run `go run ./cmd/demo` for a narrated, end-to-end walkthrough of every
+feature below in one program: basic `Put`/`Get`/`Delete` with tombstones, a
+threshold-triggered flush, a range `Scan`, L0→L1 compaction, concurrent
+readers/writers, a bloom-filter-served miss, and a real subprocess
+`kill -9` crash-recovery cycle.
+
 ## Architecture
 
 **WAL.** Every `Put`/`Delete` is first serialized as
@@ -41,13 +47,20 @@ through the same temp-file → fsync → atomic-rename discipline used
 everywhere else on disk, so a crash mid-flush leaves either nothing or a
 fully-formed file, never a half-written one at a real path.
 
-**Compaction.** As SSTables accumulate, background (synchronous, in this
-single-level design) compaction merges every live table into one new file
-via a heap-based k-way merge, keeping only the newest value per key. Since
-this compaction is single-level — the output always replaces *every*
-current table at once — a tombstone that's still the newest entry for its
-key at the end of the merge has nothing left to shadow and can be dropped
-from the output entirely, instead of carried forward forever.
+**Compaction.** Two levels: L0 holds freshly-flushed tables (may overlap in
+key range), L1 holds compacted, non-overlapping tables sized ~10x the L0
+flush target. Two independent, synchronous triggers, both a heap-based
+k-way merge keeping only the newest value per key: **L0→L1** fires once L0
+holds more than a threshold's worth of tables, merging all of L0 plus any
+overlapping L1 tables into one new L1 table; **L1→L1** fires once L1's
+total on-disk size crosses the size ratio, merging all of L1 into one new
+table. A tombstone still the newest entry for its key at the end of either
+merge can be dropped entirely — but only because each trigger provably
+includes every source that could hold an older value for any key it
+touches (see `compaction.CompactLeveled`'s `canDropTombstones` argument and
+CLAUDE.md §8 for the exact coverage proof per trigger). `Get` checks every
+live L0 table newest-to-oldest, then binary-searches L1's non-overlapping
+ranges for at most one candidate table.
 
 ## Why the MANIFEST exists
 
@@ -159,27 +172,40 @@ MANIFEST + `CURRENT` crash-safe metadata; full crash recovery
 (`CURRENT → MANIFEST → SSTable set → WAL → memtable`, in that fixed
 order); `Open`/`Put`/`Get`/`Delete`/`Close`.
 
-**Target tier (done):** single-level compaction (heap-based k-way merge,
+**Target tier (done):** two-level compaction (heap-based k-way merge,
 tombstone GC, atomic rename, MANIFEST update in the crash-safe
 ADDED-before-REMOVED order); a real-subprocess `kill -9` chaos harness
 (`cmd/chaos`, `cmd/chaosworker`) extended to trigger compaction inside the
 randomized crash window, not just ordinary writes — see
 `docs/chaos-report.md`; the four benchmarks above.
 
-**Not built (stretch, explicitly out of scope for this phase):**
-- **8a — Bloom filters.** Would let `Get` skip an SSTable's on-disk scan
-  entirely for keys it provably doesn't contain, rather than doing a
-  sparse-index search that still ends in "not found" here.
-- **8b — Range queries.** `Get` is point-lookup only; there's no ordered
-  iteration across the merged memtable+SSTable view exposed publicly yet
-  (internally, `sstable.Iterator` and `memtable.Iterator` exist, but only
-  for flush/compaction's own use).
-- **8c — Concurrent readers/writers.** `DB` is not safe for concurrent
-  use today (`maybeFlush` reassigns `db.mem`/`db.sstables`/`db.w` with no
-  synchronization) — deliberately left open rather than patched with a
-  coarse lock that might conflict with whatever design this phase
-  actually needs.
-- **8d — Multi-level compaction.** Today's compaction is single-level
-  ("merge everything periodically"); the tombstone-drop-during-compaction
-  logic is only safe because of that, and would need to be revisited if a
-  multi-level L0/L1 scheme were ever added.
+**Stretch tier (done):**
+- **8a — Bloom filters.** Every SSTable carries a self-describing bloom
+  filter (FNV-1a/Kirsch-Mitzenmacher double hashing, ~1% target FPR),
+  consulted by `Get` before the sparse-index scan to skip straight past a
+  table it provably doesn't contain the key in. ~20x fewer ns/op on a
+  100%-miss workload (263 vs 5236 ns/op). Backward-compatible with
+  pre-8a SSTable files (a missing filter section just means "always
+  scan").
+- **8b — Range queries.** `DB.Scan(start, end)` returns a sorted,
+  tombstone-filtered, newest-wins iterator over the half-open range
+  `[start, end)`, merged live across the memtable and every SSTable via
+  `compaction.MergeIterator`.
+- **8c — Concurrent readers/writers.** `Get`/`Scan` are fully lock-free
+  (an immutable `dbState` published via `atomic.Pointer`); `Put`/`Delete`
+  (and any flush/compaction they trigger) are serialized by a single
+  `writeMu` rather than a lock-free CAS guard — a deliberate deviation,
+  since the memtable's own iterator contract isn't safe under a
+  lock-free flush (see CLAUDE.md's Phase 8c notes for the full
+  reasoning). `Close` is still not safe to call concurrently with any
+  other in-flight call.
+- **8d — Multi-level compaction.** Two levels (L0/L1) as described above,
+  replacing the original single-level "merge everything" scheme; verified
+  under real-subprocess `kill -9` crashes mid-L0→L1-merge with the L1
+  non-overlap invariant checked after every recovery.
+
+Verified with `go test ./...`, `go test -race ./...`, and `go vet ./...`,
+all clean, plus dedicated adversarial tests for the trickiest correctness
+risk in the whole stretch tier: a tombstone dropped during compaction
+without genuine coverage of every older source, which would otherwise
+silently resurrect deleted data (`compaction/leveled_test.go`).
