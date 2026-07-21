@@ -169,6 +169,10 @@ func demoScan(dir string) error {
 	if err != nil {
 		return err
 	}
+	// Close is a no-op here since the loop below drains it fully (Next
+	// already auto-releases on exhaustion) -- called anyway as the
+	// idiomatic pattern for a Scan a caller might abandon early instead.
+	defer it.Close()
 	fmt.Println("Scan(key-000003, key-000010):")
 	for it.Next() {
 		fmt.Printf("  %s -> %s\n", it.Key(), it.Value())

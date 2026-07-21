@@ -496,6 +496,27 @@ func (db *DB) Delete(key []byte) error {
 	return db.write(wal.Entry{Op: wal.OpDelete, Key: key})
 }
 
+// HousekeepingError wraps an error that occurred strictly after a
+// Put/Delete's write was already durably committed (its WAL entry
+// fsync'd and its memtable mutation applied) -- e.g. a failure flushing
+// the now-oversized memtable, rotating to a new WAL segment afterward, or
+// deleting now-obsolete WAL segments. A Put/Delete that returns one of
+// these already fully happened: the key/value (or tombstone) it wrote
+// will survive a crash and is visible to Get, exactly as if this error
+// had never occurred. Callers can use errors.As to tell this apart from a
+// failure that means the write itself didn't happen -- in particular,
+// retrying a call that returned a *HousekeepingError would duplicate a
+// write already recorded once, whereas retrying any other error would not.
+type HousekeepingError struct {
+	Err error
+}
+
+func (e *HousekeepingError) Error() string {
+	return fmt.Sprintf("lsm: write succeeded but post-durability housekeeping failed: %v", e.Err)
+}
+
+func (e *HousekeepingError) Unwrap() error { return e.Err }
+
 func (db *DB) write(e wal.Entry) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
@@ -510,7 +531,19 @@ func (db *DB) write(e wal.Entry) error {
 	case wal.OpDelete:
 		s.mem.Delete(e.Key)
 	}
-	return db.maybeFlush(s)
+
+	// The write above is now fully durable (WAL fsync'd, memtable
+	// updated) regardless of what happens next: maybeFlush operates on
+	// this same memtable, and every step of it either fully commits
+	// (visible to a future Open) or fails leaving the current dbState
+	// -- this write's own memtable and WAL segment -- untouched (see
+	// maybeFlush's own doc comments for why each of its steps is safe to
+	// fail at). Any error from here on is therefore purely post-
+	// durability housekeeping, never a sign this write didn't happen.
+	if err := db.maybeFlush(s); err != nil {
+		return &HousekeepingError{Err: err}
+	}
+	return nil
 }
 
 // maybeFlush flushes s's memtable to a new SSTable if it has grown past

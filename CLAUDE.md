@@ -323,6 +323,26 @@ exceed that window. Fixed by widening the sleep to 500ms, which reliably
 lands the kill mid-burst instead of before the burst starts. This was a
 timing bug in the demo harness, not a durability bug in `wal`/`db.go`.
 
+**Follow-up session: closed both gaps left open after Phase 9.**
+`sstable.SSTable` gained reference counting (`AddRef` + a refcounted
+`Close`, starting at 1 for the implicit reference `OpenSSTable`'s caller
+holds) so a long-lived `Scan` iterator's source files stay safely
+readable — via the ordinary POSIX unlink-while-open behavior every
+`sstable` read already relied on — even after a later compaction retires
+and unlinks them; `DB.Scan` now returns a new `ScanIterator`
+(`memtable.Iterator` plus `Close`, auto-called on natural exhaustion,
+otherwise the caller's job for an abandoned iterator) instead of a bare
+`memtable.Iterator`. Separately, `Put`/`Delete` now wrap any error from a
+triggered flush in a new exported `*HousekeepingError`
+(`errors.As`-compatible), so a caller can tell "the write itself never
+happened" apart from "the write is durable, but something afterward
+failed" — previously indistinguishable. Both changes are additive (no
+LOCKED-section text touched) and covered by new dedicated tests
+(`scan_lifetime_test.go`, `housekeeping_test.go`) plus a full clean re-run
+of `go build`, `go vet`, `go test ./...`, and `go test -race ./...`. See
+the "Known deliberate gaps" section above (now both marked resolved) and
+the Deviations entries for `DB.Scan`/`ScanIterator` for the full design.
+
 Full narrative history (review-pass-by-review-pass findings, exact test
 counts, timings) lives in git history, not here — this table keeps only
 what a future session needs and can't just re-derive from the code.
@@ -353,27 +373,42 @@ what a future session needs and can't just re-derive from the code.
   8c row above and the Deviations entry below for the full design,
   including why a bare lock-free CAS guard (the more obvious design) was
   rejected as unsafe for this codebase's specific memtable implementation.
-  One narrower gap remains, carried forward rather than fully closed: a
-  `Scan` iterator's *safety* is guaranteed only for the duration of the
-  `Scan` call itself (snapshot construction) and for a memtable source
-  indefinitely after (fixed this phase, see Deviations); an SSTable source
-  in a long-lived `Scan` iterator that outlives a *later* compaction
-  retiring that specific file could see a read error from it (never
-  memory corruption or a crash) if the caller keeps pulling from the
-  iterator long after `Scan` returned. Fully closing this would need
-  per-iterator lifecycle tracking (e.g. an explicit `Close` on the
-  returned iterator) — a larger addition flagged for a future phase, not
-  solved speculatively here.
-- **A `Put`/`Delete` that durably succeeds can still return an error** if
-  purely post-durability housekeeping fails afterward (WAL segment
-  rotation in `Append`; `RemoveSegmentsBefore` at the tail of
-  `maybeFlush`). Deliberately not fixed: it never loses or corrupts data
-  and always fails in the safe direction (over-reports failure, never
-  under-reports it). Properly decoupling "write durable" from "trailing
-  cleanup succeeded" is a real return-value design question, not a bug
-  fix — worth doing if a future caller ever needs to tell those two
-  failure modes apart (e.g. to decide whether a retry would duplicate a
-  write).
+- **~~A long-lived `Scan` iterator could see a read error if a later
+  compaction retired one of its source SSTables.~~ Resolved.**
+  `sstable.SSTable` now reference-counts its underlying open file handle
+  (`AddRef`, and a `Close` that only actually closes the file once every
+  reference — the implicit one from `OpenSSTable` plus every `AddRef` —
+  has been released). `DB.Scan` calls `AddRef` on every SSTable source it
+  reads from while constructing the iterator (inside the same
+  `beginRead`/`endRead` bracket that already protected the *construction*
+  step), and returns a new `ScanIterator` (`memtable.Iterator` plus
+  `Close`) instead of a bare `memtable.Iterator`. A compaction that
+  retires one of those files still unlinks it immediately (unchanged), but
+  the file descriptor a long-lived iterator is still reading through stays
+  open and valid — standard POSIX unlink-while-open semantics, safe here
+  because every read in `sstable` already goes through the one file
+  handle opened at `OpenSSTable` time, never by reopening the path. A
+  fully-drained iterator (`Next` returns false) auto-releases its
+  references; an abandoned iterator needs an explicit `Close` to avoid
+  leaking an open file descriptor. See the Deviations entry below and
+  `scan_lifetime_test.go` (`TestScanIteratorSurvivesCompactionOfItsSources`,
+  which snapshots an in-progress iterator's source file paths, forces a
+  compaction that unlinks every one of them, and confirms the iterator
+  still reads every remaining entry correctly) for the direct proof.
+- **~~A `Put`/`Delete` that durably succeeds could return an error
+  indistinguishable from one where the write itself failed.~~ Resolved.**
+  Any error `maybeFlush` returns after a `write` call's WAL append and
+  memtable mutation have already succeeded is now wrapped in a new
+  exported `*HousekeepingError` (`Unwrap`-compatible, so `errors.As`
+  extracts the underlying cause). A caller can now tell "the write itself
+  never happened" apart from "the write is durable, but something
+  afterward — flushing, WAL segment rotation, obsolete-segment cleanup —
+  failed," which matters in particular for deciding whether a retry would
+  duplicate a write. See `housekeeping_test.go`
+  (`TestPutReturnsHousekeepingErrorWhenFlushFails`, which forces a flush
+  failure via a read-only SSTable directory and confirms both the
+  `*HousekeepingError` and that the write survives a full restart) for the
+  direct proof.
 
 **Deviations/additions beyond the LOCKED interfaces** (all additive —
 nothing in §3–§7 has changed):
@@ -450,30 +485,46 @@ nothing in §3–§7 has changed):
   real pre-8a-format file byte-for-byte and confirming it opens and reads
   correctly with no filter. Compaction-output propagation verified in
   `compaction.TestCompactOutputHasBloomFilter`.
-- `DB.Scan(start, end []byte) (memtable.Iterator, error)` (Phase 8b): new
-  public method beyond §6's listed `DB` signatures. Half-open `[start,
-  end)` range convention: `start` included, `end` excluded; `start ==
-  end` is a valid call that returns an iterator done on the first
-  `Next()`, `start > end` returns the new exported `ErrInvalidRange`
-  without constructing anything. Sorted, deduplicated, tombstone-filtered
-  across the memtable and every live SSTable, newest-wins on overlap —
-  built by reusing `compaction.MergeIterator` unmodified (one
-  `compaction.Source` per source, ranked exactly like `Get` already ranks
-  them: memtable rank 0, then `db.l0` in its existing newest-first order,
-  then every `db.l1` file whose range could overlap `[start, end)` —
-  updated by Phase 8d to source from the split `l0`/`l1` fields instead of
-  the original flat `db.sstables`, with no change to `Scan`'s own
+- `DB.Scan(start, end []byte) (ScanIterator, error)` (Phase 8b; return
+  type changed from `memtable.Iterator` to the new `ScanIterator` when the
+  file-lifetime gap below was closed): new public method beyond §6's
+  listed `DB` signatures. Half-open `[start, end)` range convention:
+  `start` included, `end` excluded; `start == end` is a valid call that
+  returns an iterator done on the first `Next()`, `start > end` returns
+  the new exported `ErrInvalidRange` without constructing anything.
+  Sorted, deduplicated, tombstone-filtered across the memtable and every
+  live SSTable, newest-wins on overlap — built by reusing
+  `compaction.MergeIterator` unmodified (one `compaction.Source` per
+  source, ranked exactly like `Get` already ranks them: memtable rank 0,
+  then `db.l0` in its existing newest-first order, then every `db.l1`
+  file whose range could overlap `[start, end)` — updated by Phase 8d to
+  source from the split `l0`/`l1` fields instead of the original flat
+  `db.sstables`, with no change to `Scan`'s own
   half-open-range/tombstone-filtering logic), rather than reimplementing
-  k-way merge/newest-wins resolution a second time. The returned type is
-  `memtable.Iterator` —
-  the interface already defined in §6, not a new shape — implemented by
-  a new unexported `rangeIterator` (in the new file `scan.go`) that wraps
-  `MergeIterator` to enforce the `end` bound (which `MergeIterator` has
-  no concept of) and to drop tombstones (a tombstoned key must never be
-  yielded at all, since `Iterator`'s 3-method shape has no found/
-  tombstone pair the way `Get` does). `rangeIterator.Key()`/`Value()`
-  return clones, not aliases into a source's internal buffer, matching
-  the existing defensive-copy convention (`SkipList.Get`).
+  k-way merge/newest-wins resolution a second time. Implemented by an
+  unexported `rangeIterator` (in `scan.go`) that wraps `MergeIterator` to
+  enforce the `end` bound (which `MergeIterator` has no concept of) and to
+  drop tombstones (a tombstoned key must never be yielded at all, since
+  `Iterator`'s 3-method shape has no found/tombstone pair the way `Get`
+  does). `rangeIterator.Key()`/`Value()` return clones, not aliases into a
+  source's internal buffer, matching the existing defensive-copy
+  convention (`SkipList.Get`).
+- `ScanIterator` interface (`memtable.Iterator` plus `Close() error`) and
+  `sstable.SSTable.AddRef()`/refcounted `Close()`: close the file-lifetime
+  gap noted below Phase 8b's original entry (see "Known deliberate gaps"
+  above for the full design and the direct test proving it). `Scan`
+  `AddRef`s every SSTable source while building the merge (inside the same
+  `beginRead`/`endRead` bracket that already protects snapshot
+  construction), and `rangeIterator` releases them via `Close` — called
+  automatically once `Next` is naturally exhausted, or explicitly by the
+  caller for an iterator abandoned before that point. `sstable.SSTable`
+  itself now carries an `atomic.Int32` reference count (starting at 1 for
+  the implicit reference `OpenSSTable`'s caller holds); its file handle is
+  only actually closed once every reference has been released, relying on
+  ordinary POSIX unlink-while-open semantics for the already-unlinked case
+  (every `sstable` read goes through the one file handle opened at
+  `OpenSSTable` time, never by reopening the path, so this was already a
+  safe assumption to lean on).
 - `memtable.SkipList.SeekIterator(start []byte) Iterator`: new method,
   lands on the first key >= start via the same O(log n) multi-level
   descent `Get`/`insert` already use, instead of iterating from the head
@@ -493,13 +544,16 @@ nothing in §3–§7 has changed):
   `compaction.SortedIterator`'s exact method shape (`Next`/`Key`/`Value`/
   `Tombstone`) structurally, so no new interface or adapter type was
   needed to feed them into `compaction.Source`/`NewMergeIterator`.
-- **Known limitation, deliberately not fixed this phase**: a `Scan`
-  iterator's behavior is undefined if the `DB` is mutated (`Put`,
-  `Delete`, or a flush/compaction a later `Put`/`Delete` triggers) while
-  that iterator is still in use — `Scan` snapshots `db.mem`/`db.l0`/`db.l1`
-  at call time but holds no lock beyond that. This is the same "`DB` is
-  not safe for concurrent use" gap already on record above; fixing it is
-  Phase 8c's exclusive scope, not this one's.
+- **Known limitation, deliberately not fixed this phase (Phase 8b) —
+  ~~resolved by Phase 8c, then fully closed later~~**: at the time this was
+  written, a `Scan` iterator's behavior was undefined if the `DB` was
+  mutated while that iterator was still in use. Phase 8c's lock-free
+  `dbState` snapshot design fixed the *content* half of this (a `Scan`'s
+  results are unaffected by any later mutation, by construction); the
+  remaining *file-lifetime* half (a long-lived iterator surviving a
+  compaction that retires its source files) was closed later via
+  `sstable.SSTable`'s `AddRef`/`Close` refcounting and `ScanIterator` —
+  see the "Known deliberate gaps" section above.
 - **Phase 8d (two-level compaction)** additions, all additive beyond
   §3/§5/§7/§8's *current* LOCKED text — see the "Proposed LOCKED-section
   changes" block below for the exact replacement text this phase asks a
@@ -633,17 +687,17 @@ nothing in §3–§7 has changed):
     never observes a read error (the direct test of the
     inFlightReaders/drainReaders mechanism); an in-flight `Get`/`Scan`
     snapshot remains valid and correct across a concurrent state swap.
-  - **Known limitation carried forward, not fully closed this phase**:
-    `Scan`'s returned iterator is only protected against a racing file
-    close for the duration of the `Scan` call itself (snapshot
-    construction); the memtable source is now safe indefinitely after
-    (see the `skipListIterator` fix above), but an SSTable source in a
-    long-lived iterator that outlives a *later* compaction retiring that
-    specific file could still surface a read error (not a crash or
-    memory corruption) if the caller keeps calling `Next()` long after
-    `Scan` returned. See the "Known deliberate gaps" entry above for the
-    full reasoning and why this is flagged for a future phase rather than
-    solved here.
+  - **Known limitation carried forward at the time this phase was
+    written — ~~later fully closed~~**: `Scan`'s returned iterator was
+    only protected against a racing file close for the duration of the
+    `Scan` call itself (snapshot construction); the memtable source was
+    already safe indefinitely after (see the `skipListIterator` fix
+    above), but an SSTable source in a long-lived iterator that outlived a
+    *later* compaction retiring that specific file could still surface a
+    read error. This was closed in a later session via
+    `sstable.SSTable.AddRef`/refcounted `Close` and the new
+    `ScanIterator` — see the "Known deliberate gaps" entry above for the
+    full design and its direct test.
 
 ## 12. Testing conventions
 
@@ -659,32 +713,39 @@ nothing in §3–§7 has changed):
 
 ## Immediate next steps (as of this session)
 
-Both the 8c/8d review and the Phase 9 demo are now done and committed-ready
-(see the Phase 9 status entry above for the full detail). Concretely, as
-of this session: `go build ./...`, `go vet ./...`, `go test ./...` (417s),
-and `go test -race ./...` (542s) are all clean; `gofmt -l .` reports no
-files; `go run ./cmd/demo` runs all 7 sections successfully and
-repeatably.
+The 8c/8d review and the Phase 9 demo (previous session) are done. This
+session closed both of the two remaining known gaps carried forward from
+8b/8c:
 
-**Nothing from this session is committed yet.** `git status --short`
-shows: `CLAUDE.md`, `README.md`, `db.go` (new `DB.Stats()` diagnostic
-method) modified, plus new `cmd/demo/main.go`. Before picking this back
-up, review `cmd/demo/main.go` and `DB.Stats()` and commit if acceptable.
+1. **`Scan`-iterator-outliving-a-compaction**, via `sstable.SSTable`
+   reference counting (`AddRef` + a refcounted `Close`) and a new
+   `ScanIterator` return type (`memtable.Iterator` plus `Close`). See the
+   "Known deliberate gaps" section above for the design and
+   `scan_lifetime_test.go` for the direct test (snapshots an in-progress
+   iterator's source files, forces a compaction that unlinks all of them,
+   confirms the iterator still reads everything correctly).
+2. **`Put`/`Delete` returning an error indistinguishable from a real write
+   failure**, via a new exported `*HousekeepingError` (`errors.As`-
+   compatible) wrapping any error `maybeFlush` returns after the write's
+   own WAL append + memtable mutation already succeeded. See
+   `housekeeping_test.go` for the direct test (forces a flush failure via
+   a read-only SSTable directory, confirms both the error type and that
+   the write survives a full restart).
 
-**Known gaps intentionally left open** (unchanged from 8c/8d, not
-re-litigated further): `Scan`'s returned iterator is only protected
-against a racing file close for the duration of the `Scan` call itself
-(an SSTable source in a long-lived iterator could still surface a read
-error, never corruption, if a later compaction retires that file while
-the caller keeps pulling from it); `Put`/`Delete` can return an error
-after durably succeeding if purely post-durability housekeeping fails
-(deliberately out of scope, never loses or corrupts data).
+Both are additive (no LOCKED-section changes needed) and covered by new
+dedicated tests, plus the full existing suite re-run clean. `cmd/demo`'s
+Scan section was updated to call the new `Close()` (a no-op there, since
+it drains fully, but demonstrates the idiomatic pattern for a caller that
+might not).
+
+**Nothing from this session is committed yet.** Before picking this back
+up: review the refcounting change in `sstable/reader.go`, the
+`ScanIterator`/`rangeIterator` changes in `scan.go`, `HousekeepingError`
+in `db.go`, and the two new test files, then commit if acceptable.
 
 **Next up:** the full scope tier (Minimum + Target + Stretch, §9) plus a
-demo are all implemented end-to-end. There's no required next phase —
-remaining work is open-ended, the user's call. Candidates not yet done:
-closing the `Scan`-iterator-outliving-a-compaction gap noted above;
-decoupling "write durable" from "trailing cleanup succeeded" in
-`Put`/`Delete`'s error return; a third+ compaction level, if ever wanted
-(explicitly out of scope per §3's Phase 8d note, would need a fresh
-decision to revisit).
+demo are all implemented end-to-end, and both previously-known gaps are
+now closed. There's no required next phase — remaining work is
+open-ended, the user's call. One candidate not yet done: a third+
+compaction level, if ever wanted (explicitly out of scope per §3's Phase
+8d note, would need a fresh decision to revisit).

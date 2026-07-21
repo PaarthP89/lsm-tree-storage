@@ -6,10 +6,25 @@ import (
 
 	"github.com/paarthsiphone/lsm-tree-storage/compaction"
 	"github.com/paarthsiphone/lsm-tree-storage/memtable"
+	"github.com/paarthsiphone/lsm-tree-storage/sstable"
 )
 
 // ErrInvalidRange is returned by Scan when start > end.
 var ErrInvalidRange = errors.New("lsm: invalid range: start > end")
+
+// ScanIterator is what Scan returns: a memtable.Iterator plus a Close that
+// releases this iterator's hold on every SSTable it reads from (see
+// rangeIterator's doc comment for why that hold exists). If the iterator
+// is drained to completion (Next returns false), Close is already called
+// automatically and calling it again is a harmless no-op -- the common
+// `for it.Next() { ... }` pattern needs no explicit Close at all. Only an
+// iterator abandoned before Next ever returns false needs Close called
+// explicitly, to avoid leaving its source SSTables' file handles open
+// indefinitely.
+type ScanIterator interface {
+	memtable.Iterator
+	Close() error
+}
 
 func cloneBytes(b []byte) []byte {
 	if b == nil {
@@ -51,21 +66,20 @@ func cloneBytes(b []byte) []byte {
 // iterator, which keeps walking the SSTable/memtable objects live at
 // snapshot time.
 //
-// The one gap Phase 8c does NOT close: those objects are protected from
-// being closed/removed out from under a reader only for the duration of
-// this Scan call itself (see DB.inFlightReaders) -- once Scan returns,
-// the caller's continued Next() calls on the returned iterator are no
-// longer tracked. A sufficiently long-lived Scan iterator racing a
-// concurrent compaction that retires one of its source SSTables could
-// therefore see a read error from that source's Next() (the file was
-// closed), though never memory corruption or a crash -- sstable.Iterator
-// surfaces a closed file as a decode error via Err(), the same path as
-// any other read failure. Fully closing this gap would need per-iterator
-// lifecycle tracking (e.g. an explicit Close on the returned iterator,
-// with the file-retirement side accounting for iterators that are never
-// drained) -- a larger addition than this phase's stated scope, flagged
-// here for a future phase rather than solved speculatively.
-func (db *DB) Scan(start, end []byte) (memtable.Iterator, error) {
+// Every SSTable source is AddRef'd while it's added (see
+// sstable.SSTable.AddRef): that keeps each source's file handle open for
+// as long as the returned iterator might still read from it, even across
+// a later compaction that retires the file from the DB's own live-SSTable
+// list and releases the DB's reference. The returned ScanIterator's Close
+// (automatic once fully drained, otherwise the caller's job -- see
+// ScanIterator's doc comment) releases these references in turn, at which
+// point the file is actually closed once no reference to it remains
+// anywhere. This is what closes the one gap Phase 8c's Get/Scan
+// lock-free design left open: without it, a long-lived Scan iterator
+// racing a concurrent compaction could see a read error from a source
+// whose file was closed out from under it, even though never memory
+// corruption or a crash.
+func (db *DB) Scan(start, end []byte) (ScanIterator, error) {
 	if bytes.Compare(start, end) > 0 {
 		return nil, ErrInvalidRange
 	}
@@ -74,14 +88,24 @@ func (db *DB) Scan(start, end []byte) (memtable.Iterator, error) {
 	defer db.endRead()
 	s := db.state.Load()
 
+	var refs []*sstable.SSTable
+	releaseRefs := func() {
+		for _, st := range refs {
+			st.Close()
+		}
+	}
+
 	sources := make([]compaction.Source, 0, 1+len(s.l0)+len(s.l1))
 	sources = append(sources, compaction.Source{Iter: s.mem.SeekIterator(start), Rank: 0})
 	rank := 1
 	for _, st := range s.l0 {
 		it, err := st.SeekIterator(start)
 		if err != nil {
+			releaseRefs()
 			return nil, err
 		}
+		st.AddRef()
+		refs = append(refs, st)
 		sources = append(sources, compaction.Source{Iter: it, Rank: rank})
 		rank++
 	}
@@ -99,13 +123,16 @@ func (db *DB) Scan(start, end []byte) (memtable.Iterator, error) {
 		}
 		it, err := st.SeekIterator(start)
 		if err != nil {
+			releaseRefs()
 			return nil, err
 		}
+		st.AddRef()
+		refs = append(refs, st)
 		sources = append(sources, compaction.Source{Iter: it, Rank: rank})
 		rank++
 	}
 
-	return &rangeIterator{src: compaction.NewMergeIterator(sources), end: end}, nil
+	return &rangeIterator{src: compaction.NewMergeIterator(sources), end: end, refs: refs}, nil
 }
 
 // rangeIterator adapts a compaction.MergeIterator into Scan's contract:
@@ -115,11 +142,13 @@ func (db *DB) Scan(start, end []byte) (memtable.Iterator, error) {
 // "deleted" the way Get's found/tombstone pair does, so a key whose
 // newest entry is a delete marker must simply never appear at all.
 type rangeIterator struct {
-	src      *compaction.MergeIterator
-	end      []byte
-	curKey   []byte
-	curValue []byte
-	done     bool
+	src          *compaction.MergeIterator
+	end          []byte
+	curKey       []byte
+	curValue     []byte
+	done         bool
+	refs         []*sstable.SSTable
+	refsReleased bool
 }
 
 func (it *rangeIterator) Next() bool {
@@ -129,6 +158,7 @@ func (it *rangeIterator) Next() bool {
 	for it.src.Next() {
 		if bytes.Compare(it.src.Key(), it.end) >= 0 {
 			it.done = true
+			it.Close()
 			return false
 		}
 		if it.src.Tombstone() {
@@ -146,6 +176,7 @@ func (it *rangeIterator) Next() bool {
 		return true
 	}
 	it.done = true
+	it.Close()
 	return false
 }
 
@@ -156,3 +187,22 @@ func (it *rangeIterator) Value() []byte { return it.curValue }
 // tombstoned key in the first place (see the doc comment above), so
 // there is never a "found but deleted" result for a caller to check.
 func (it *rangeIterator) Tombstone() bool { return false }
+
+// Close releases this iterator's reference on every SSTable source it
+// reads from (see ScanIterator's doc comment). Idempotent -- Next already
+// calls this once the iterator is naturally exhausted, so a caller that
+// drains an iterator to completion never needs to call Close itself; it's
+// only required for an iterator abandoned before that point.
+func (it *rangeIterator) Close() error {
+	if it.refsReleased {
+		return nil
+	}
+	it.refsReleased = true
+	var firstErr error
+	for _, st := range it.refs {
+		if err := st.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}

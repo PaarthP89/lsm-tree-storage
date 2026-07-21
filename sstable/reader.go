@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"github.com/paarthsiphone/lsm-tree-storage/wal"
 )
@@ -17,6 +18,19 @@ import (
 // only its footer (the sparse index and min/max key metadata) -- the
 // data section is never read except for the small bounded range a Get
 // actually needs.
+//
+// refCount starts at 1 (the reference implicitly held by whoever called
+// OpenSSTable) and is incremented by AddRef, e.g. by a long-lived Scan
+// iterator (see lsm.DB.Scan) that needs this table's file handle to stay
+// open even after the DB's own live-SSTable-list reference is released by
+// a later compaction. The file is only actually closed once every
+// reference -- the implicit initial one plus every AddRef -- has been
+// matched by a Close call. This is what lets a retired file be safely
+// unlinked (os.Remove) immediately while a lingering reader keeps working
+// against its still-open file descriptor, the standard POSIX unlink-while-
+// open behavior every read in this type already relies on (Get/Iterator/
+// SeekIterator all read through the one file handle opened here, never by
+// reopening path).
 type SSTable struct {
 	path         string
 	file         *os.File
@@ -26,6 +40,7 @@ type SSTable struct {
 	index        []indexEntry
 	footerOffset int64
 	bloom        *bloomFilter // nil for a pre-8a file or an empty table
+	refCount     atomic.Int32
 }
 
 // OpenSSTable opens the file at path and parses its footer. It returns an
@@ -78,7 +93,7 @@ func OpenSSTable(path string) (*SSTable, error) {
 		return nil, fmt.Errorf("sstable: %s: %w", path, err)
 	}
 
-	return &SSTable{
+	st := &SSTable{
 		path:         path,
 		file:         f,
 		minKey:       minKey,
@@ -87,11 +102,28 @@ func OpenSSTable(path string) (*SSTable, error) {
 		index:        index,
 		footerOffset: footerOffset,
 		bloom:        bloom,
-	}, nil
+	}
+	st.refCount.Store(1)
+	return st, nil
 }
 
-// Close closes the underlying file handle.
+// AddRef adds one reference to this table, keeping its underlying file
+// handle open even after a later Close call that would otherwise have
+// closed it -- see the type's doc comment. Every AddRef must be matched by
+// exactly one later Close.
+func (s *SSTable) AddRef() {
+	s.refCount.Add(1)
+}
+
+// Close releases one reference to this table. The underlying file handle
+// is only actually closed once every reference (the implicit one from
+// OpenSSTable, plus every AddRef) has been released by a matching Close
+// call -- see the type's doc comment. Safe to call from multiple
+// independent owners.
 func (s *SSTable) Close() error {
+	if s.refCount.Add(-1) > 0 {
+		return nil
+	}
 	return s.file.Close()
 }
 
